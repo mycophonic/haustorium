@@ -1,3 +1,4 @@
+// Package dcoffset detects DC bias in PCM audio streams.
 package dcoffset
 
 import (
@@ -40,40 +41,7 @@ func Detect(reader io.Reader, format types.PCMFormat) (*types.DCOffsetResult, er
 			completeFrames := (n / frameSize) * frameSize
 			data := buf[:completeFrames]
 
-			switch format.BitDepth {
-			case types.Depth16:
-				for i := 0; i < len(data); i += 2 {
-					channel := (i / 2) % numChannels
-					sample := float64(
-						int16(binary.LittleEndian.Uint16(data[i:])),
-					) / maxVal
-					channelSums[channel] += sample
-					samples++
-				}
-			case types.Depth24:
-				for i := 0; i < len(data); i += 3 {
-					channel := (i / 3) % numChannels
-
-					raw := int32(data[i]) | int32(data[i+1])<<8 | int32(data[i+2])<<16
-					if raw&0x800000 != 0 {
-						raw |= ^0xFFFFFF
-					}
-
-					sample := float64(raw) / maxVal
-					channelSums[channel] += sample
-					samples++
-				}
-			case types.Depth32:
-				for i := 0; i < len(data); i += 4 {
-					channel := (i / 4) % numChannels
-					sample := float64(
-						int32(binary.LittleEndian.Uint32(data[i:])),
-					) / maxVal
-					channelSums[channel] += sample
-					samples++
-				}
-			default:
-			}
+			samples += accumulateSamples(data, format.BitDepth, maxVal, numChannels, channelSums)
 		}
 
 		if err == io.EOF {
@@ -88,7 +56,7 @@ func Detect(reader io.Reader, format types.PCMFormat) (*types.DCOffsetResult, er
 	if samples == 0 {
 		return &types.DCOffsetResult{
 			Offset:   0,
-			OffsetDb: -120.0,
+			OffsetDB: shared.SilenceFloorDB,
 			Channels: make([]float64, numChannels),
 			Samples:  0,
 		}, nil
@@ -106,15 +74,60 @@ func Detect(reader io.Reader, format types.PCMFormat) (*types.DCOffsetResult, er
 
 	totalOffset /= float64(numChannels)
 
-	offsetDb := 20 * math.Log10(totalOffset)
-	if math.IsInf(offsetDb, -1) {
-		offsetDb = -120.0
+	offsetDB := shared.DBMultiplier * math.Log10(totalOffset)
+	if math.IsInf(offsetDB, -1) {
+		offsetDB = shared.SilenceFloorDB
 	}
 
 	return &types.DCOffsetResult{
 		Offset:   totalOffset,
-		OffsetDb: offsetDb,
+		OffsetDB: offsetDB,
 		Channels: channelOffsets,
 		Samples:  samples,
 	}, nil
+}
+
+// accumulateSamples reads PCM samples from data and adds their normalized values to channelSums.
+// It returns the number of samples processed.
+func accumulateSamples(
+	data []byte, bitDepth types.BitDepth, maxVal float64, numChannels int, channelSums []float64,
+) uint64 {
+	var count uint64
+
+	switch bitDepth {
+	case types.Depth16:
+		for i := 0; i < len(data); i += 2 {
+			channel := (i / 2) % numChannels
+			sample := float64(
+				int16(binary.LittleEndian.Uint16(data[i:])), //nolint:gosec // PCM sample conversion
+			) / maxVal
+			channelSums[channel] += sample
+			count++
+		}
+	case types.Depth24:
+		for i := 0; i < len(data); i += 3 {
+			channel := (i / 3) % numChannels
+
+			raw := int32(data[i]) | int32(data[i+1])<<shared.Shift8 | int32(data[i+2])<<16
+			if raw&shared.Mask24Sign != 0 {
+				raw |= ^shared.Mask24Extend
+			}
+
+			sample := float64(raw) / maxVal
+			channelSums[channel] += sample
+			count++
+		}
+	case types.Depth32:
+		for i := 0; i < len(data); i += 4 {
+			channel := (i / 4) % numChannels
+			sample := float64(
+				int32(binary.LittleEndian.Uint32(data[i:])), //nolint:gosec // PCM sample conversion
+			) / maxVal
+			channelSums[channel] += sample
+			count++
+		}
+	default:
+	}
+
+	return count
 }

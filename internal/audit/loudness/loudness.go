@@ -1,4 +1,4 @@
-//nolint:staticcheck // too dumb
+// Package loudness implements EBU R128 loudness measurement and dynamic range analysis.
 package loudness
 
 import (
@@ -6,13 +6,68 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"sort"
+	"slices"
 
 	"github.com/farcloser/primordium/fault"
 
 	"github.com/farcloser/haustorium/internal/audit/shared"
 	"github.com/farcloser/haustorium/internal/types"
 )
+
+// EBU R128 and K-weighting constants.
+const (
+	// K-weighting pre-filter (high shelf) parameters.
+	preFilterCenterFreq = 1681.974450955533
+	preFilterGainDb     = 3.999843853973347
+	preFilterQ          = 0.7071752369554196
+	preFilterVbExponent = 0.4996667741545416
+
+	// K-weighting RLB (high pass) parameters.
+	rlbCenterFreq = 38.13547087602444
+	rlbQ          = 0.5003270373238773
+
+	// Surround channel weight for Ls/Rs (~+1.5 dB).
+	surroundWeight = 1.41
+
+	// EBU R128 gating thresholds.
+	absoluteGateLUFS   = -70
+	relativeGateOffset = 10
+	lraRelativeGate    = 20
+
+	// EBU R128 LRA percentiles.
+	lraLowPercentile  = 0.10
+	lraHighPercentile = 0.95
+
+	// Momentary window: 400 ms.
+	momentaryWindowMs = 400
+	// Short-term window: 3 seconds.
+	shortTermWindowSec = 3
+	// Hop size: 100 ms.
+	hopMs = 100
+
+	// DR calculation: top 20% of RMS values (1/5).
+	drTop20Divisor = 5
+
+	// DR score clamping range.
+	drMinScore = 1
+	drMaxScore = 20
+
+	// dbDivisor is the power-to-dB conversion factor: 10 * log10(power).
+	dbDivisor = 10
+
+	// Surround channel index range.
+	surroundChStart = 3
+	surroundChEnd   = 4
+	surroundMinCh   = 4
+)
+
+// drResult holds the output of dynamic range calculation.
+type drResult struct {
+	score  int
+	value  float64
+	peakDB float64
+	rmsDB  float64
+}
 
 // Biquad filter coefficients.
 type biquad struct {
@@ -42,33 +97,26 @@ func getKWeightingFilters(rate int) (pre, rlb biquad) {
 
 	// Pre-filter (high shelf)
 	// Models the acoustic effects of the head
-	centerFreq := 1681.974450955533
-	G := 3.999843853973347
-	qualityFactor := 0.7071752369554196
+	bilinearK := math.Tan(math.Pi * preFilterCenterFreq / sampleRate)
+	headGainV := math.Pow(10, preFilterGainDb/float64(shared.DBMultiplier))
+	vb := math.Pow(headGainV, preFilterVbExponent)
 
-	bilinearK := math.Tan(math.Pi * centerFreq / sampleRate)
-	headGainV := math.Pow(10, G/20)
-	Vb := math.Pow(headGainV, 0.4996667741545416)
-
-	gain := 1 + bilinearK/qualityFactor + bilinearK*bilinearK
-	pre.b0 = (headGainV + Vb*bilinearK/qualityFactor + bilinearK*bilinearK) / gain
+	gain := 1 + bilinearK/preFilterQ + bilinearK*bilinearK
+	pre.b0 = (headGainV + vb*bilinearK/preFilterQ + bilinearK*bilinearK) / gain
 	pre.b1 = 2 * (bilinearK*bilinearK - headGainV) / gain
-	pre.b2 = (headGainV - Vb*bilinearK/qualityFactor + bilinearK*bilinearK) / gain
+	pre.b2 = (headGainV - vb*bilinearK/preFilterQ + bilinearK*bilinearK) / gain
 	pre.a1 = 2 * (bilinearK*bilinearK - 1) / gain
-	pre.a2 = (1 - bilinearK/qualityFactor + bilinearK*bilinearK) / gain
+	pre.a2 = (1 - bilinearK/preFilterQ + bilinearK*bilinearK) / gain
 
 	// RLB weighting (high pass)
-	centerFreq = 38.13547087602444
-	qualityFactor = 0.5003270373238773
+	bilinearK = math.Tan(math.Pi * rlbCenterFreq / sampleRate)
 
-	bilinearK = math.Tan(math.Pi * centerFreq / sampleRate)
-
-	gain = 1 + bilinearK/qualityFactor + bilinearK*bilinearK
+	gain = 1 + bilinearK/rlbQ + bilinearK*bilinearK
 	rlb.b0 = 1 / gain
 	rlb.b1 = -2 / gain
 	rlb.b2 = 1 / gain
 	rlb.a1 = 2 * (bilinearK*bilinearK - 1) / gain
-	rlb.a2 = (1 - bilinearK/qualityFactor + bilinearK*bilinearK) / gain
+	rlb.a2 = (1 - bilinearK/rlbQ + bilinearK*bilinearK) / gain
 
 	return pre, rlb
 }
@@ -76,15 +124,15 @@ func getKWeightingFilters(rate int) (pre, rlb biquad) {
 // Channel weights for surround (we only handle stereo for now).
 func getChannelWeight(channel, numChannels int) float64 {
 	if numChannels <= 2 {
-		return 1.0
+		return shared.FullScale
 	}
 	// For surround: L, R, C = 1.0; Ls, Rs = 1.41 (~+1.5dB)
 	// LFE is excluded
-	if channel >= 3 && channel <= 4 && numChannels > 4 {
-		return 1.41
+	if channel >= surroundChStart && channel <= surroundChEnd && numChannels > surroundMinCh {
+		return surroundWeight
 	}
 
-	return 1.0
+	return shared.FullScale
 }
 
 // drBlock holds peak and RMS for a 3-second analysis block.
@@ -140,6 +188,9 @@ type meter struct {
 func newMeter(sampleRate, numChannels int) *meter {
 	pre, rlb := getKWeightingFilters(sampleRate)
 
+	momentarySize := sampleRate * momentaryWindowMs / shared.MsPerSec
+	shortTermSize := sampleRate * shortTermWindowSec
+
 	return &meter{
 		numChannels:   numChannels,
 		sampleRate:    sampleRate,
@@ -147,14 +198,14 @@ func newMeter(sampleRate, numChannels int) *meter {
 		rlb:           rlb,
 		preState:      make([]biquadState, numChannels),
 		rlbState:      make([]biquadState, numChannels),
-		momentarySize: sampleRate * 400 / 1000,
-		shortTermSize: sampleRate * 3,
-		blockSize:     sampleRate * 3,
-		hopSize:       sampleRate * 100 / 1000,
-		momentaryBuf:  make([]float64, sampleRate*400/1000),
-		shortTermBuf:  make([]float64, sampleRate*3),
-		momentaryMax:  -120,
-		shortTermMax:  -120,
+		momentarySize: momentarySize,
+		shortTermSize: shortTermSize,
+		blockSize:     sampleRate * shortTermWindowSec,
+		hopSize:       sampleRate * hopMs / shared.MsPerSec,
+		momentaryBuf:  make([]float64, momentarySize),
+		shortTermBuf:  make([]float64, shortTermSize),
+		momentaryMax:  shared.SilenceFloorDB,
+		shortTermMax:  shared.SilenceFloorDB,
 		frameSamples:  make([]float64, numChannels),
 	}
 }
@@ -176,7 +227,12 @@ func (m *meter) processFrame() {
 		framePower += weight * filtered * filtered
 	}
 
-	// Update DR block.
+	m.updateDRBlock(framePower, framePeak)
+	m.updateWindows(framePower)
+}
+
+// updateDRBlock accumulates power and peak into the current DR block.
+func (m *meter) updateDRBlock(framePower, framePeak float64) {
 	m.blockSum += framePower / float64(m.numChannels)
 
 	if framePeak > m.blockPeak {
@@ -192,7 +248,10 @@ func (m *meter) processFrame() {
 		m.blockPeak = 0
 		m.blockSamples = 0
 	}
+}
 
+// updateWindows updates the momentary and short-term ring buffers and computes windowed loudness.
+func (m *meter) updateWindows(framePower float64) {
 	// Update momentary window (ring buffer).
 	old := m.momentaryBuf[m.momentaryPos]
 	m.momentaryBuf[m.momentaryPos] = framePower
@@ -218,22 +277,27 @@ func (m *meter) processFrame() {
 
 	// Every hop, calculate windowed loudness.
 	if m.sampleCount%m.hopSize == 0 {
-		if m.momentaryFilled == m.momentarySize {
-			momentaryLoudness := -0.691 + 10*math.Log10(m.momentarySum/float64(m.momentarySize))
-			m.momentaryPowers = append(m.momentaryPowers, m.momentarySum/float64(m.momentarySize))
+		m.recordWindowedLoudness()
+	}
+}
 
-			if momentaryLoudness > m.momentaryMax {
-				m.momentaryMax = momentaryLoudness
-			}
+// recordWindowedLoudness computes and records momentary/short-term loudness at each hop.
+func (m *meter) recordWindowedLoudness() {
+	if m.momentaryFilled == m.momentarySize {
+		momentaryLoudness := -shared.LufsOffset + dbDivisor*math.Log10(m.momentarySum/float64(m.momentarySize))
+		m.momentaryPowers = append(m.momentaryPowers, m.momentarySum/float64(m.momentarySize))
+
+		if momentaryLoudness > m.momentaryMax {
+			m.momentaryMax = momentaryLoudness
 		}
+	}
 
-		if m.shortTermFilled == m.shortTermSize {
-			shortTermLoudness := -0.691 + 10*math.Log10(m.shortTermSum/float64(m.shortTermSize))
-			m.shortTermPowers = append(m.shortTermPowers, m.shortTermSum/float64(m.shortTermSize))
+	if m.shortTermFilled == m.shortTermSize {
+		shortTermLoudness := -shared.LufsOffset + dbDivisor*math.Log10(m.shortTermSum/float64(m.shortTermSize))
+		m.shortTermPowers = append(m.shortTermPowers, m.shortTermSum/float64(m.shortTermSize))
 
-			if shortTermLoudness > m.shortTermMax {
-				m.shortTermMax = shortTermLoudness
-			}
+		if shortTermLoudness > m.shortTermMax {
+			m.shortTermMax = shortTermLoudness
 		}
 	}
 }
@@ -248,21 +312,22 @@ func (m *meter) finalize() *types.LoudnessResult {
 
 	integratedLUFS := calculateIntegratedLoudness(m.momentaryPowers)
 	lra := calculateLoudnessRange(m.shortTermPowers)
-	drScore, drValue, peakDb, rmsDb := calculateDR(m.drBlocks)
+	dr := calculateDR(m.drBlocks)
 
 	return &types.LoudnessResult{
 		IntegratedLUFS: integratedLUFS,
 		ShortTermMax:   m.shortTermMax,
 		MomentaryMax:   m.momentaryMax,
 		LoudnessRange:  lra,
-		DRScore:        drScore,
-		DRValue:        drValue,
-		PeakDb:         peakDb,
-		RmsDb:          rmsDb,
+		DRScore:        dr.score,
+		DRValue:        dr.value,
+		PeakDB:         dr.peakDB,
+		RmsDB:          dr.rmsDB,
 		Frames:         m.totalFrames,
 	}
 }
 
+// Analyze performs EBU R128 loudness measurement on PCM audio data.
 func Analyze(reader io.Reader, format types.PCMFormat) (*types.LoudnessResult, error) {
 	bytesPerSample := int(format.BitDepth / 8) //nolint:gosec // bit depth and channel count are small constants
 	numChannels := int(format.Channels)        //nolint:gosec // bit depth and channel count are small constants
@@ -291,44 +356,7 @@ func Analyze(reader io.Reader, format types.PCMFormat) (*types.LoudnessResult, e
 			completeFrames := (n / frameSize) * frameSize
 			data := buf[:completeFrames]
 
-			switch format.BitDepth {
-			case types.Depth16:
-				for i := 0; i < len(data); i += frameSize {
-					for ch := range numChannels {
-						measurement.frameSamples[ch] = float64(
-							int16(binary.LittleEndian.Uint16(data[i+ch*2:])),
-						) / maxVal
-					}
-
-					measurement.processFrame()
-				}
-			case types.Depth24:
-				for i := 0; i < len(data); i += frameSize {
-					for channel := range numChannels {
-						offset := i + channel*3
-
-						raw := int32(data[offset]) | int32(data[offset+1])<<8 | int32(data[offset+2])<<16
-						if raw&0x800000 != 0 {
-							raw |= ^0xFFFFFF
-						}
-
-						measurement.frameSamples[channel] = float64(raw) / maxVal
-					}
-
-					measurement.processFrame()
-				}
-			case types.Depth32:
-				for i := 0; i < len(data); i += frameSize {
-					for ch := range numChannels {
-						measurement.frameSamples[ch] = float64(
-							int32(binary.LittleEndian.Uint32(data[i+ch*4:])),
-						) / maxVal
-					}
-
-					measurement.processFrame()
-				}
-			default:
-			}
+			decodeLoudnessFrames(data, format.BitDepth, frameSize, numChannels, maxVal, measurement)
 		}
 
 		if err == io.EOF {
@@ -343,9 +371,51 @@ func Analyze(reader io.Reader, format types.PCMFormat) (*types.LoudnessResult, e
 	return measurement.finalize(), nil
 }
 
+// decodeLoudnessFrames decodes PCM frames and feeds them to the meter.
+func decodeLoudnessFrames(data []byte, bitDepth types.BitDepth, frameSize, numChannels int, maxVal float64, m *meter) {
+	switch bitDepth {
+	case types.Depth16:
+		for i := 0; i < len(data); i += frameSize {
+			for ch := range numChannels {
+				m.frameSamples[ch] = float64(
+					int16(binary.LittleEndian.Uint16(data[i+ch*2:])), //nolint:gosec // PCM sample conversion
+				) / maxVal
+			}
+
+			m.processFrame()
+		}
+	case types.Depth24:
+		for i := 0; i < len(data); i += frameSize {
+			for channel := range numChannels {
+				offset := i + channel*3
+
+				raw := int32(data[offset]) | int32(data[offset+1])<<shared.Shift8 | int32(data[offset+2])<<16
+				if raw&shared.Mask24Sign != 0 {
+					raw |= ^shared.Mask24Extend
+				}
+
+				m.frameSamples[channel] = float64(raw) / maxVal
+			}
+
+			m.processFrame()
+		}
+	case types.Depth32:
+		for i := 0; i < len(data); i += frameSize {
+			for ch := range numChannels {
+				m.frameSamples[ch] = float64(
+					int32(binary.LittleEndian.Uint32(data[i+ch*4:])), //nolint:gosec // PCM sample conversion
+				) / maxVal
+			}
+
+			m.processFrame()
+		}
+	default:
+	}
+}
+
 func calculateIntegratedLoudness(powers []float64) float64 {
 	if len(powers) == 0 {
-		return -120
+		return shared.SilenceFloorDB
 	}
 
 	// First pass: absolute gate at -70 LUFS
@@ -355,27 +425,27 @@ func calculateIntegratedLoudness(powers []float64) float64 {
 	)
 
 	for _, p := range powers {
-		lufs := -0.691 + 10*math.Log10(p)
-		if lufs > -70 {
+		lufs := -shared.LufsOffset + dbDivisor*math.Log10(p)
+		if lufs > absoluteGateLUFS {
 			sum += p
 			count++
 		}
 	}
 
 	if count == 0 {
-		return -120
+		return shared.SilenceFloorDB
 	}
 
 	// Relative threshold: -10 LU below ungated mean
 	ungatedMean := sum / float64(count)
-	relativeThreshold := -0.691 + 10*math.Log10(ungatedMean) - 10
+	relativeThreshold := -shared.LufsOffset + dbDivisor*math.Log10(ungatedMean) - relativeGateOffset
 
 	// Second pass: relative gate
 	sum = 0
 	count = 0
 
 	for _, p := range powers {
-		lufs := -0.691 + 10*math.Log10(p)
+		lufs := -shared.LufsOffset + dbDivisor*math.Log10(p)
 		if lufs > relativeThreshold {
 			sum += p
 			count++
@@ -383,10 +453,10 @@ func calculateIntegratedLoudness(powers []float64) float64 {
 	}
 
 	if count == 0 {
-		return -120
+		return shared.SilenceFloorDB
 	}
 
-	return -0.691 + 10*math.Log10(sum/float64(count))
+	return -shared.LufsOffset + dbDivisor*math.Log10(sum/float64(count))
 }
 
 func calculateLoudnessRange(powers []float64) float64 {
@@ -398,8 +468,8 @@ func calculateLoudnessRange(powers []float64) float64 {
 	var lufsValues []float64
 
 	for _, p := range powers {
-		lufs := -0.691 + 10*math.Log10(p)
-		if lufs > -70 {
+		lufs := -shared.LufsOffset + dbDivisor*math.Log10(p)
+		if lufs > absoluteGateLUFS {
 			lufsValues = append(lufsValues, lufs)
 		}
 	}
@@ -415,7 +485,7 @@ func calculateLoudnessRange(powers []float64) float64 {
 	}
 
 	mean := sum / float64(len(lufsValues))
-	relativeThreshold := mean - 20
+	relativeThreshold := mean - lraRelativeGate
 
 	var gated []float64
 
@@ -430,16 +500,16 @@ func calculateLoudnessRange(powers []float64) float64 {
 	}
 
 	// LRA = difference between 95th and 10th percentile
-	sort.Float64s(gated)
-	low := gated[int(float64(len(gated))*0.10)]
-	high := gated[int(float64(len(gated))*0.95)]
+	slices.Sort(gated)
+	low := gated[int(float64(len(gated))*lraLowPercentile)]
+	high := gated[int(float64(len(gated))*lraHighPercentile)]
 
 	return high - low
 }
 
-func calculateDR(blocks []drBlock) (score int, value, peakDb, rmsDb float64) {
+func calculateDR(blocks []drBlock) drResult {
 	if len(blocks) == 0 {
-		return 0, 0, -120, -120
+		return drResult{0, 0, shared.SilenceFloorDB, shared.SilenceFloorDB}
 	}
 
 	// Sort blocks by peak (descending)
@@ -448,7 +518,17 @@ func calculateDR(blocks []drBlock) (score int, value, peakDb, rmsDb float64) {
 		peaksSorted[i] = b.peak
 	}
 
-	sort.Sort(sort.Reverse(sort.Float64Slice(peaksSorted)))
+	slices.SortFunc(peaksSorted, func(a, b float64) int {
+		if a > b {
+			return -1
+		}
+
+		if a < b {
+			return 1
+		}
+
+		return 0
+	})
 
 	// Use second-highest peak (avoid outliers)
 	peakIdx := 1
@@ -464,10 +544,20 @@ func calculateDR(blocks []drBlock) (score int, value, peakDb, rmsDb float64) {
 		rmsSorted[i] = b.rms
 	}
 
-	sort.Sort(sort.Reverse(sort.Float64Slice(rmsSorted)))
+	slices.SortFunc(rmsSorted, func(a, b float64) int {
+		if a > b {
+			return -1
+		}
+
+		if a < b {
+			return 1
+		}
+
+		return 0
+	})
 
 	// Average top 20% of RMS values
-	top20Count := max(len(rmsSorted)/5, 1)
+	top20Count := max(len(rmsSorted)/drTop20Divisor, 1)
 
 	var rmsSum float64
 	for i := range top20Count {
@@ -477,17 +567,17 @@ func calculateDR(blocks []drBlock) (score int, value, peakDb, rmsDb float64) {
 	rms := rmsSum / float64(top20Count)
 
 	if rms == 0 {
-		return 0, 0, -120, -120
+		return drResult{0, 0, shared.SilenceFloorDB, shared.SilenceFloorDB}
 	}
 
 	// DR = 20 * log10(peak / rms)
-	dynamicRange := 20 * math.Log10(peak/rms)
+	dynamicRange := float64(shared.DBMultiplier) * math.Log10(peak/rms)
 
 	// Clamp to DR1-DR20
-	score = min(max(int(math.Round(dynamicRange)), 1), 20)
+	score := min(max(int(math.Round(dynamicRange)), drMinScore), drMaxScore)
 
-	peakDb = 20 * math.Log10(peak)
-	rmsDb = 20 * math.Log10(rms)
+	peakDB := float64(shared.DBMultiplier) * math.Log10(peak)
+	rmsDB := float64(shared.DBMultiplier) * math.Log10(rms)
 
-	return score, dynamicRange, peakDb, rmsDb
+	return drResult{score, dynamicRange, peakDB, rmsDB}
 }

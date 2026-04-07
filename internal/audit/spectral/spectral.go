@@ -1,4 +1,3 @@
-//nolint:staticcheck // too dumb
 package spectral
 
 import (
@@ -15,6 +14,67 @@ import (
 	"github.com/farcloser/haustorium/internal/types"
 )
 
+const (
+	defaultFFTSize    = 8192
+	defaultWindowsMax = 100
+
+	// defaultNoiseFlatnessCutoff is the Wiener entropy threshold for HF noise classification.
+	defaultNoiseFlatnessCutoff = 0.4
+
+	// Spectral analysis frequency constants.
+	refBandStartHz = 1000
+	refBandEndHz   = 10000
+	nfBandStartHz  = 14000
+	nfBandEndHz    = 18000
+
+	// Brick wall detection parameters.
+	brickWallBelowOffset = 1500
+	brickWallAboveOffset = 1500
+	brickWallNarrow      = 500
+	brickWallSpan        = 1000
+
+	// Detection thresholds.
+	upsampleDropThreshold       = 20
+	upsampleSharpnessThreshold  = 40
+	transcodeDropThreshold      = 15
+	transcodeSharpnessThreshold = 30
+	transcodeProximity          = 2000
+	brickWallMinDrop            = 10
+	humSpikeThreshold           = 15
+	humSharpnessMin             = 6
+
+	// Hann window coefficient.
+	hannCoeff = 0.5
+
+	// Band energy margin factor.
+	bandMarginLow  = 0.9
+	bandMarginHigh = 1.1
+
+	// Percentile bin adjacency.
+	humAdjacentRange = 5
+	humBinGuard      = 2
+
+	// Mains hum fundamental frequencies.
+	humFreq50Hz = 50
+	humFreq60Hz = 60
+
+	// Harmonic count for hum detection.
+	humHarmonicCount = 6
+
+	// firstHarmonic is the starting harmonic multiplier.
+	firstHarmonic = 1.0
+
+	// Minimum sample rate that could be upsampled.
+	minUpsampleRate = 44100
+
+	// shift16 is the bit shift for 24-bit high-byte decoding.
+	shift16 = 16
+
+	// readBufFrames is the number of frames per read buffer.
+	spectralReadBufFrames = 4096
+)
+
+// Options configures spectral analysis.
 type Options struct {
 	FFTSize    int // default 8192
 	WindowsMax int // max windows to analyze; 0 = all (default 100)
@@ -27,14 +87,16 @@ type Options struct {
 	NoiseFlatnessCutoff float64
 }
 
+// DefaultOptions returns the default spectral analysis options.
 func DefaultOptions() Options {
 	return Options{
-		FFTSize:             8192,
-		WindowsMax:          100,
-		NoiseFlatnessCutoff: 0.4,
+		FFTSize:             defaultFFTSize,
+		WindowsMax:          defaultWindowsMax,
+		NoiseFlatnessCutoff: defaultNoiseFlatnessCutoff,
 	}
 }
 
+//nolint:gochecknoglobals // constant lookup table for lossy transcode cutoff frequencies
 var transcodeCutoffs = []struct {
 	freq  float64
 	codec string
@@ -48,6 +110,7 @@ var transcodeCutoffs = []struct {
 	{20500, "Opus 128"},
 }
 
+//nolint:gochecknoglobals // constant lookup table for upsample Nyquist frequencies
 var upsampleNyquists = []struct {
 	rate    int
 	nyquist float64
@@ -58,13 +121,17 @@ var upsampleNyquists = []struct {
 	{96000, 48000},
 }
 
+//nolint:gochecknoglobals // constant lookup table for band energy analysis frequencies
+var bandFrequencies = []float64{100, 500, 1000, 2000, 4000, 8000, 12000, 16000, 20000, 22050, 24000, 30000, 40000}
+
+// Analyze performs spectral analysis on PCM audio data.
 func Analyze(reader io.Reader, format types.PCMFormat, opts Options) (*types.SpectralResult, error) {
 	if opts.FFTSize == 0 {
-		opts.FFTSize = 8192
+		opts.FFTSize = defaultFFTSize
 	}
 
 	if opts.WindowsMax == 0 {
-		opts.WindowsMax = 100
+		opts.WindowsMax = defaultWindowsMax
 	}
 
 	fftSize := opts.FFTSize
@@ -124,10 +191,10 @@ func Analyze(reader io.Reader, format types.PCMFormat, opts Options) (*types.Spe
 	binHz := float64(format.SampleRate) / float64(fftSize)
 	nyquist := float64(format.SampleRate) / 2
 
-	magDb := toDb(avgMagnitude)
+	magDB := toDB(avgMagnitude)
 
 	// Reference level: 1-10 kHz average.
-	refLevel := bandAverage(magDb, 1000, 10000, binHz)
+	refLevel := bandAverage(magDB, refBandStartHz, refBandEndHz, binHz)
 
 	result := &types.SpectralResult{
 		ClaimedRate: format.SampleRate,
@@ -135,32 +202,92 @@ func Analyze(reader io.Reader, format types.PCMFormat, opts Options) (*types.Spe
 	}
 
 	// === Sample rate authenticity ===
-	if format.SampleRate > 44100 {
-		detectUpsampling(result, magDb, binHz, nyquist, refLevel)
+	if format.SampleRate > minUpsampleRate {
+		detectUpsampling(result, magDB, binHz, nyquist, refLevel)
 	}
 
 	// === Lossy transcode detection ===
-	detectTranscode(result, magDb, binHz, nyquist, refLevel)
+	detectTranscode(result, magDB, binHz, nyquist, refLevel)
 
 	// === Hum detection ===
-	detectHum(result, magDb, binHz, refLevel)
+	detectHum(result, magDB, binHz, refLevel)
 
 	// === Noise floor ===
-	detectNoiseFloor(result, magDb, binHz, nyquist, refLevel)
+	detectNoiseFloor(result, magDB, binHz, nyquist, refLevel)
 
 	// === Spectral centroid ===
 	result.SpectralCentroid = calculateCentroid(avgMagnitude, binHz)
 
 	// === Band energy for debugging ===
-	result.BandEnergy, result.BandFreqs = calculateBandEnergy(magDb, binHz, nyquist, refLevel)
+	result.BandEnergy, result.BandFreqs = calculateBandEnergy(magDB, binHz, nyquist, refLevel)
 
 	return result, nil
 }
 
+// decodeMono16 decodes 16-bit PCM frames into mono-mixed samples.
+func decodeMono16(data []byte, frameSize, numChannels int, maxVal float64) []float64 {
+	samples := make([]float64, 0, len(data)/frameSize)
+
+	for i := 0; i < len(data); i += frameSize {
+		var sum float64
+		for ch := range numChannels {
+			sum += float64(
+				int16(binary.LittleEndian.Uint16(data[i+ch*2:])), //nolint:gosec // PCM sample conversion
+			) / maxVal
+		}
+
+		samples = append(samples, sum/float64(numChannels))
+	}
+
+	return samples
+}
+
+// decodeMono24 decodes 24-bit PCM frames into mono-mixed samples.
+func decodeMono24(data []byte, frameSize, numChannels int, maxVal float64) []float64 {
+	samples := make([]float64, 0, len(data)/frameSize)
+
+	for i := 0; i < len(data); i += frameSize {
+		var sum float64
+
+		for ch := range numChannels {
+			offset := i + ch*3
+
+			raw := int32(data[offset]) | int32(data[offset+1])<<shared.Shift8 | int32(data[offset+2])<<shift16
+			if raw&shared.Mask24Sign != 0 {
+				raw |= ^shared.Mask24Extend
+			}
+
+			sum += float64(raw) / maxVal
+		}
+
+		samples = append(samples, sum/float64(numChannels))
+	}
+
+	return samples
+}
+
+// decodeMono32 decodes 32-bit PCM frames into mono-mixed samples.
+func decodeMono32(data []byte, frameSize, numChannels int, maxVal float64) []float64 {
+	samples := make([]float64, 0, len(data)/frameSize)
+
+	for i := 0; i < len(data); i += frameSize {
+		var sum float64
+		for ch := range numChannels {
+			sum += float64(
+				int32(binary.LittleEndian.Uint32(data[i+ch*4:])), //nolint:gosec // PCM sample conversion
+			) / maxVal
+		}
+
+		samples = append(samples, sum/float64(numChannels))
+	}
+
+	return samples
+}
+
 // readMonoMixed reads the entire PCM stream and returns mono-mixed samples.
 func readMonoMixed(reader io.Reader, format types.PCMFormat) ([]float64, error) {
-	bytesPerSample := int(format.BitDepth / 8) //nolint:gosec // bit depth and channel count are small constants
-	numChannels := int(format.Channels)        //nolint:gosec // bit depth and channel count are small constants
+	bytesPerSample := int(format.BitDepth / shared.Shift8) //nolint:gosec // bit depth is a small constant
+	numChannels := int(format.Channels)                    //nolint:gosec // channel count is a small constant
 	frameSize := bytesPerSample * numChannels
 
 	var maxVal float64
@@ -175,7 +302,7 @@ func readMonoMixed(reader io.Reader, format types.PCMFormat) ([]float64, error) 
 	default:
 	}
 
-	readBuf := make([]byte, frameSize*4096)
+	readBuf := make([]byte, frameSize*spectralReadBufFrames)
 
 	var samples []float64
 
@@ -187,44 +314,11 @@ func readMonoMixed(reader io.Reader, format types.PCMFormat) ([]float64, error) 
 
 			switch format.BitDepth {
 			case types.Depth16:
-				for i := 0; i < len(data); i += frameSize {
-					var sum float64
-					for ch := range numChannels {
-						sum += float64(
-							int16(binary.LittleEndian.Uint16(data[i+ch*2:])),
-						) / maxVal
-					}
-
-					samples = append(samples, sum/float64(numChannels))
-				}
+				samples = append(samples, decodeMono16(data, frameSize, numChannels, maxVal)...)
 			case types.Depth24:
-				for i := 0; i < len(data); i += frameSize {
-					var sum float64
-
-					for ch := range numChannels {
-						offset := i + ch*3
-
-						raw := int32(data[offset]) | int32(data[offset+1])<<8 | int32(data[offset+2])<<16
-						if raw&0x800000 != 0 {
-							raw |= ^0xFFFFFF
-						}
-
-						sum += float64(raw) / maxVal
-					}
-
-					samples = append(samples, sum/float64(numChannels))
-				}
+				samples = append(samples, decodeMono24(data, frameSize, numChannels, maxVal)...)
 			case types.Depth32:
-				for i := 0; i < len(data); i += frameSize {
-					var sum float64
-					for ch := range numChannels {
-						sum += float64(
-							int32(binary.LittleEndian.Uint32(data[i+ch*4:])),
-						) / maxVal
-					}
-
-					samples = append(samples, sum/float64(numChannels))
-				}
+				samples = append(samples, decodeMono32(data, frameSize, numChannels, maxVal)...)
 			default:
 			}
 		}
@@ -279,26 +373,26 @@ func windowPositions(totalSamples, fftSize, maxWindows int) []int {
 func makeHannWindow(size int) []float64 {
 	window := make([]float64, size)
 	for i := range window {
-		window[i] = 0.5 * (1 - math.Cos(2*math.Pi*float64(i)/float64(size-1)))
+		window[i] = hannCoeff * (1 - math.Cos(2*math.Pi*float64(i)/float64(size-1)))
 	}
 
 	return window
 }
 
-func toDb(magnitude []float64) []float64 {
+func toDB(magnitude []float64) []float64 {
 	decibels := make([]float64, len(magnitude))
 	for i, m := range magnitude {
 		if m > 0 {
-			decibels[i] = 20 * math.Log10(m)
+			decibels[i] = float64(shared.DBMultiplier) * math.Log10(m)
 		} else {
-			decibels[i] = -120
+			decibels[i] = shared.SilenceFloorDB
 		}
 	}
 
 	return decibels
 }
 
-func bandAverage(magDb []float64, startHz, endHz, binHz float64) float64 {
+func bandAverage(magDB []float64, startHz, endHz, binHz float64) float64 {
 	startBin := int(startHz / binHz)
 	endBin := int(endHz / binHz)
 
@@ -306,31 +400,31 @@ func bandAverage(magDb []float64, startHz, endHz, binHz float64) float64 {
 		startBin = 0
 	}
 
-	if endBin >= len(magDb) {
-		endBin = len(magDb) - 1
+	if endBin >= len(magDB) {
+		endBin = len(magDB) - 1
 	}
 
 	if startBin > endBin {
-		return -120
+		return shared.SilenceFloorDB
 	}
 
 	var sum float64
 	for i := startBin; i <= endBin; i++ {
-		sum += magDb[i]
+		sum += magDB[i]
 	}
 
 	return sum / float64(endBin-startBin+1)
 }
 
-func detectBrickWall(magDb []float64, checkFreq, binHz float64) (drop, sharpness float64) {
-	belowLevel := bandAverage(magDb, checkFreq-1500, checkFreq-500, binHz)
-	aboveLevel := bandAverage(magDb, checkFreq+500, checkFreq+1500, binHz)
+func detectBrickWall(magDB []float64, checkFreq, binHz float64) (drop, sharpness float64) {
+	belowLevel := bandAverage(magDB, checkFreq-brickWallBelowOffset, checkFreq-brickWallNarrow, binHz)
+	aboveLevel := bandAverage(magDB, checkFreq+brickWallNarrow, checkFreq+brickWallAboveOffset, binHz)
 
 	drop = belowLevel - aboveLevel
 
-	if drop > 10 {
-		freqBelow := checkFreq - 1000
-		freqAbove := checkFreq + 1000
+	if drop > brickWallMinDrop {
+		freqBelow := checkFreq - brickWallSpan
+		freqAbove := checkFreq + brickWallSpan
 		octaves := math.Log2(freqAbove / freqBelow)
 		sharpness = drop / octaves
 	}
@@ -338,7 +432,7 @@ func detectBrickWall(magDb []float64, checkFreq, binHz float64) (drop, sharpness
 	return drop, sharpness
 }
 
-func detectUpsampling(result *types.SpectralResult, magDb []float64, binHz, nyquist, refLevel float64) {
+func detectUpsampling(result *types.SpectralResult, magDB []float64, binHz, nyquist, _ float64) {
 	var (
 		bestSharpness float64
 		bestCutoff    float64
@@ -350,16 +444,16 @@ func detectUpsampling(result *types.SpectralResult, magDb []float64, binHz, nyqu
 			continue
 		}
 
-		drop, sharpness := detectBrickWall(magDb, sampleRate.nyquist, binHz)
+		drop, sharpness := detectBrickWall(magDB, sampleRate.nyquist, binHz)
 
-		if drop > 20 && sharpness > bestSharpness {
+		if drop > upsampleDropThreshold && sharpness > bestSharpness {
 			bestSharpness = sharpness
 			bestCutoff = sampleRate.nyquist
 			bestRate = sampleRate.rate
 		}
 	}
 
-	if bestSharpness > 40 {
+	if bestSharpness > upsampleSharpnessThreshold {
 		result.IsUpsampled = true
 		result.EffectiveRate = bestRate
 		result.UpsampleCutoff = bestCutoff
@@ -367,7 +461,7 @@ func detectUpsampling(result *types.SpectralResult, magDb []float64, binHz, nyqu
 	}
 }
 
-func detectTranscode(result *types.SpectralResult, magDb []float64, binHz, nyquist, refLevel float64) {
+func detectTranscode(result *types.SpectralResult, magDB []float64, binHz, nyquist, _ float64) {
 	// Only check if claimed sample rate is 44.1/48k (or if upsampled from there)
 	// Transcode detection looks for cutoffs below 22kHz
 	var (
@@ -381,20 +475,20 @@ func detectTranscode(result *types.SpectralResult, magDb []float64, binHz, nyqui
 			continue
 		}
 		// Don't flag upsample cutoff as transcode
-		if result.IsUpsampled && math.Abs(transcodeInfo.freq-result.UpsampleCutoff) < 2000 {
+		if result.IsUpsampled && math.Abs(transcodeInfo.freq-result.UpsampleCutoff) < transcodeProximity {
 			continue
 		}
 
-		drop, sharpness := detectBrickWall(magDb, transcodeInfo.freq, binHz)
+		drop, sharpness := detectBrickWall(magDB, transcodeInfo.freq, binHz)
 
-		if drop > 15 && sharpness > bestSharpness {
+		if drop > transcodeDropThreshold && sharpness > bestSharpness {
 			bestSharpness = sharpness
 			bestCutoff = transcodeInfo.freq
 			bestCodec = transcodeInfo.codec
 		}
 	}
 
-	if bestSharpness > 30 {
+	if bestSharpness > transcodeSharpnessThreshold {
 		result.IsTranscode = true
 		result.TranscodeCutoff = bestCutoff
 		result.TranscodeSharpness = bestSharpness
@@ -402,71 +496,37 @@ func detectTranscode(result *types.SpectralResult, magDb []float64, binHz, nyqui
 	}
 }
 
-func detectHum(result *types.SpectralResult, magDb []float64, binHz, refLevel float64) {
+func detectHum(result *types.SpectralResult, magDB []float64, binHz, _ float64) {
 	// Check 50Hz and harmonics (100, 150, 200, 250, 300 Hz)
-	hum50 := detectHumFrequency(magDb, 50, binHz, refLevel)
+	hum50 := detectHumFrequency(magDB, humFreq50Hz, binHz)
 	// Check 60Hz and harmonics (120, 180, 240, 300, 360 Hz)
-	hum60 := detectHumFrequency(magDb, 60, binHz, refLevel)
+	hum60 := detectHumFrequency(magDB, humFreq60Hz, binHz)
 
-	if hum50 > 15 {
+	if hum50 > humSpikeThreshold {
 		result.Has50HzHum = true
-		result.HumLevelDb = hum50
+		result.HumLevelDB = hum50
 	}
 
-	if hum60 > 15 {
+	if hum60 > humSpikeThreshold {
 		result.Has60HzHum = true
-		if hum60 > result.HumLevelDb {
-			result.HumLevelDb = hum60
+		if hum60 > result.HumLevelDB {
+			result.HumLevelDB = hum60
 		}
 	}
 }
 
-func detectHumFrequency(magDb []float64, fundamental, binHz, refLevel float64) float64 {
-	harmonics := []float64{1, 2, 3, 4, 5, 6}
-
+func detectHumFrequency(magDB []float64, fundamental, binHz float64) float64 {
 	var maxSpike float64
 
-	for _, harmonic := range harmonics {
+	for harmonic := firstHarmonic; harmonic <= humHarmonicCount; harmonic++ {
 		freq := fundamental * harmonic
 		bin := int(freq / binHz)
 
-		if bin <= 2 || bin >= len(magDb)-2 {
+		if bin <= humBinGuard || bin >= len(magDB)-humBinGuard {
 			continue
 		}
 
-		// Peak at harmonic.
-		peakLevel := magDb[bin]
-
-		// Average of surrounding bins (±5 bins, excluding ±1).
-		var surroundSum float64
-
-		surroundCount := 0
-
-		for idx := bin - 5; idx <= bin+5; idx++ {
-			if idx >= 0 && idx < len(magDb) && (idx < bin-1 || idx > bin+1) {
-				surroundSum += magDb[idx]
-				surroundCount++
-			}
-		}
-
-		surroundAvg := surroundSum / float64(surroundCount)
-
-		spike := peakLevel - surroundAvg
-
-		// Peak sharpness check: real mains hum is a razor-sharp spectral line
-		// concentrated in 1-2 FFT bins, while musical bass content (synth, kick)
-		// spreads energy across many bins. Require the peak bin to stand at least
-		// 6 dB above the average of its immediate neighbors (±1 bin) to qualify
-		// as a genuine tonal spike rather than a broad spectral bump.
-		if bin >= 1 && bin < len(magDb)-1 {
-			adjacentAvg := (magDb[bin-1] + magDb[bin+1]) / 2
-			sharpness := peakLevel - adjacentAvg
-
-			if sharpness < 6 {
-				continue
-			}
-		}
-
+		spike := measureHumSpike(magDB, bin)
 		if spike > maxSpike {
 			maxSpike = spike
 		}
@@ -475,12 +535,44 @@ func detectHumFrequency(magDb []float64, fundamental, binHz, refLevel float64) f
 	return maxSpike
 }
 
-func detectNoiseFloor(result *types.SpectralResult, magDb []float64, binHz, nyquist, refLevel float64) {
-	// Measure energy in 14-18 kHz band relative to reference
-	// Real music has content here; pure noise floor is flat
-	// We're looking for elevated flat noise, not natural rolloff
-	hfLevel := bandAverage(magDb, 14000, 18000, binHz)
-	result.NoiseFloorDb = hfLevel - refLevel
+// measureHumSpike measures the spectral spike at a given bin relative to its surroundings.
+func measureHumSpike(magDB []float64, bin int) float64 {
+	peakLevel := magDB[bin]
+
+	// Average of surrounding bins (±5 bins, excluding ±1).
+	var surroundSum float64
+
+	surroundCount := 0
+
+	for idx := bin - humAdjacentRange; idx <= bin+humAdjacentRange; idx++ {
+		if idx >= 0 && idx < len(magDB) && (idx < bin-1 || idx > bin+1) {
+			surroundSum += magDB[idx]
+			surroundCount++
+		}
+	}
+
+	surroundAvg := surroundSum / float64(surroundCount)
+
+	spike := peakLevel - surroundAvg
+
+	// Peak sharpness check: real mains hum is a razor-sharp spectral line
+	// concentrated in 1-2 FFT bins, while musical bass content (synth, kick)
+	// spreads energy across many bins.
+	if bin >= 1 && bin < len(magDB)-1 {
+		adjacentAvg := (magDB[bin-1] + magDB[bin+1]) / 2
+		sharpness := peakLevel - adjacentAvg
+
+		if sharpness < humSharpnessMin {
+			return 0
+		}
+	}
+
+	return spike
+}
+
+func detectNoiseFloor(result *types.SpectralResult, magDB []float64, binHz, _, refLevel float64) {
+	hfLevel := bandAverage(magDB, nfBandStartHz, nfBandEndHz, binHz)
+	result.NoiseFloorDB = hfLevel - refLevel
 }
 
 func calculateCentroid(magnitude []float64, binHz float64) float64 {
@@ -502,20 +594,13 @@ func calculateCentroid(magnitude []float64, binHz float64) float64 {
 	return weightedSum / totalMag
 }
 
-func calculateBandEnergy(magDb []float64, binHz, nyquist, refLevel float64) ([]float64, []float64) {
-	bands := []float64{100, 500, 1000, 2000, 4000, 8000, 12000, 16000, 20000, 22050, 24000, 30000, 40000}
-
-	var (
-		energy []float64
-		freqs  []float64
-	)
-
-	for _, freq := range bands {
+func calculateBandEnergy(magDB []float64, binHz, nyquist, refLevel float64) (energy, freqs []float64) {
+	for _, freq := range bandFrequencies {
 		if freq >= nyquist {
 			break
 		}
 
-		level := bandAverage(magDb, freq*0.9, freq*1.1, binHz)
+		level := bandAverage(magDB, freq*bandMarginLow, freq*bandMarginHigh, binHz)
 		energy = append(energy, level-refLevel)
 		freqs = append(freqs, freq)
 	}

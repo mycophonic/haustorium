@@ -1,4 +1,4 @@
-//nolint:staticcheck,wrapcheck // too dumb
+//nolint:wrapcheck // too dumb
 package main
 
 import (
@@ -12,11 +12,14 @@ import (
 
 	"github.com/urfave/cli/v3"
 
-	haustorium "github.com/farcloser/haustorium"
+	"github.com/farcloser/haustorium"
 	"github.com/farcloser/haustorium/internal/types"
 )
 
-var errInvalidArgCount = errors.New("expected exactly one argument: file path or \"-\" for stdin")
+var (
+	errInvalidArgCount = errors.New("expected exactly one argument: file path or \"-\" for stdin")
+	errUnknownCheck    = errors.New("unknown check")
+)
 
 func analyzeCommand() *cli.Command {
 	return &cli.Command{
@@ -35,7 +38,7 @@ func analyzeCommand() *cli.Command {
 				Name:    "bit-depth",
 				Aliases: []string{"b"},
 				Usage:   "Bit depth (16, 24, or 32)",
-				Value:   32,
+				Value:   bitDepth32,
 			},
 			&cli.IntFlag{
 				Name:    "channels",
@@ -151,13 +154,19 @@ func parsePCMFormat(cmd *cli.Command) (types.PCMFormat, error) {
 
 var errInvalidBitDepth = errors.New("must be 16, 24, or 32")
 
+const (
+	bitDepth16 = 16
+	bitDepth24 = 24
+	bitDepth32 = 32
+)
+
 func toBitDepth(v int) (types.BitDepth, error) {
 	switch v {
-	case 16:
+	case bitDepth16:
 		return types.Depth16, nil
-	case 24:
+	case bitDepth24:
 		return types.Depth24, nil
-	case 32:
+	case bitDepth32:
 		return types.Depth32, nil
 	default:
 		return 0, errInvalidBitDepth
@@ -199,7 +208,7 @@ func parseChecks(raw string) (haustorium.Check, error) {
 
 		check, ok := checkNames[name]
 		if !ok {
-			return 0, fmt.Errorf("unknown check %q", name)
+			return 0, fmt.Errorf("%q: %w", name, errUnknownCheck)
 		}
 
 		result |= check

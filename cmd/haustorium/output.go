@@ -61,7 +61,12 @@ var categoryOrder = []string{
 	"5. Digital artifacts",
 }
 
-func outputResult(filePath string, result *haustorium.Result, formatName string, debug bool) error {
+func outputResult(
+	filePath string,
+	result *haustorium.Result,
+	formatName string,
+	debug bool,
+) error { //nolint:flag-parameter // debug is a simple toggle from CLI flag
 	formatter, err := format.GetFormatter(formatName)
 	if err != nil {
 		return err
@@ -140,21 +145,25 @@ func buildProperties(result *haustorium.Result) map[string]any {
 	}
 
 	if r := result.TruePeak; r != nil {
-		props["true_peak"] = fmt.Sprintf("%.1f dBTP", r.TruePeakDb)
+		props["true_peak"] = fmt.Sprintf("%.1f dBTP", r.TruePeakDB)
 	}
 
 	if r := result.Spectral; r != nil {
 		props["spectral_centroid"] = fmt.Sprintf("%.0f Hz", r.SpectralCentroid)
-		props["noise_floor"] = fmt.Sprintf("%.1f dB", r.NoiseFloorDb)
+		props["noise_floor"] = fmt.Sprintf("%.1f dB", r.NoiseFloorDB)
 	}
 
-	if r := result.Stereo; r != nil {
-		props["stereo_width"] = fmt.Sprintf("%s (correlation: %.2f)", stereoWidthLabel(r.Correlation), r.Correlation)
-		if math.Abs(r.ImbalanceDb) > 0.5 {
+	if stereoResult := result.Stereo; stereoResult != nil {
+		props["stereo_width"] = fmt.Sprintf(
+			"%s (correlation: %.2f)",
+			stereoWidthLabel(stereoResult.Correlation),
+			stereoResult.Correlation,
+		)
+		if math.Abs(stereoResult.ImbalanceDB) > correlationNormal {
 			props["channel_imbalance"] = fmt.Sprintf(
 				"%.1f dB (%s louder)",
-				math.Abs(r.ImbalanceDb),
-				imbalanceSide(r.ImbalanceDb),
+				math.Abs(stereoResult.ImbalanceDB),
+				imbalanceSide(stereoResult.ImbalanceDB),
 			)
 		}
 	}
@@ -170,23 +179,30 @@ func buildProperties(result *haustorium.Result) map[string]any {
 	return props
 }
 
+const (
+	correlationMono   = 0.95
+	correlationNarrow = 0.75
+	correlationNormal = 0.5
+	correlationWide   = 0.2
+)
+
 func stereoWidthLabel(correlation float64) string {
 	switch {
-	case correlation > 0.95:
+	case correlation > correlationMono:
 		return "Mono/Narrow"
-	case correlation > 0.75:
+	case correlation > correlationNarrow:
 		return "Narrow"
-	case correlation > 0.5:
+	case correlation > correlationNormal:
 		return "Normal"
-	case correlation > 0.2:
+	case correlation > correlationWide:
 		return "Wide"
 	default:
 		return "Very Wide"
 	}
 }
 
-func imbalanceSide(imbalanceDb float64) string {
-	if imbalanceDb > 0 {
+func imbalanceSide(imbalanceDB float64) string {
+	if imbalanceDB > 0 {
 		return "left"
 	}
 

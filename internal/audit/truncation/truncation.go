@@ -1,3 +1,4 @@
+// Package truncation detects abruptly truncated audio by analyzing the tail of the PCM stream.
 package truncation
 
 import (
@@ -16,6 +17,7 @@ const (
 	defaultWindowMs uint = 50
 )
 
+// Detect checks whether the final windowMs of audio suggests abrupt truncation.
 func Detect(r io.ReadSeeker, format types.PCMFormat, windowMs uint) (*types.TruncationDetection, error) {
 	if windowMs == 0 {
 		windowMs = defaultWindowMs
@@ -26,7 +28,7 @@ func Detect(r io.ReadSeeker, format types.PCMFormat, windowMs uint) (*types.Trun
 	)
 	tailSamples := format.SampleRate * int(
 		windowMs,
-	) / 1000 * int(
+	) / shared.MsPerSec * int(
 		format.Channels,
 	)
 	tailBytes := int64(tailSamples * bytesPerSample)
@@ -84,9 +86,9 @@ func Detect(r io.ReadSeeker, format types.PCMFormat, windowMs uint) (*types.Trun
 		}
 	case types.Depth24:
 		for i := 0; i < len(data); i += 3 {
-			sample := int32(data[i]) | int32(data[i+1])<<8 | int32(data[i+2])<<16
-			if sample&0x800000 != 0 {
-				sample |= ^0xFFFFFF
+			sample := int32(data[i]) | int32(data[i+1])<<shared.Shift8 | int32(data[i+2])<<16
+			if sample&shared.Mask24Sign != 0 {
+				sample |= ^shared.Mask24Extend
 			}
 
 			normalized := float64(sample) / maxVal
@@ -118,27 +120,27 @@ func Detect(r io.ReadSeeker, format types.PCMFormat, windowMs uint) (*types.Trun
 	if count == 0 {
 		return &types.TruncationDetection{
 			IsTruncated:   false,
-			FinalRmsDb:    -120.0,
-			FinalPeakDb:   -120.0,
+			FinalRmsDB:    shared.SilenceFloorDB,
+			FinalPeakDB:   shared.SilenceFloorDB,
 			SamplesInTail: 0,
 		}, nil
 	}
 
 	rms := math.Sqrt(sumSquares / float64(count))
-	rmsDb := 20 * math.Log10(rms)
-	peakDb := 20 * math.Log10(peak)
+	rmsDB := shared.DBMultiplier * math.Log10(rms)
+	peakDB := shared.DBMultiplier * math.Log10(peak)
 
-	if math.IsInf(rmsDb, -1) {
-		rmsDb = -120.0
+	if math.IsInf(rmsDB, -1) {
+		rmsDB = shared.SilenceFloorDB
 	}
 
-	if math.IsInf(peakDb, -1) {
-		peakDb = -120.0
+	if math.IsInf(peakDB, -1) {
+		peakDB = shared.SilenceFloorDB
 	}
 
 	return &types.TruncationDetection{
-		FinalRmsDb:    rmsDb,
-		FinalPeakDb:   peakDb,
+		FinalRmsDB:    rmsDB,
+		FinalPeakDB:   peakDB,
 		SamplesInTail: count,
 	}, nil
 }

@@ -1,4 +1,3 @@
-//nolint:staticcheck // too dumb on Db vs. DB
 package types
 
 type BitDepth uint
@@ -49,7 +48,7 @@ The Result provides raw measurements. Here are suggested interpretation guidelin
 
 ## By Final RMS Level
 
-| FinalRmsDb    | Interpretation                | Confidence |
+| FinalRmsDB    | Interpretation                | Confidence |
 |---------------|-------------------------------|------------|
 | < -60 dB      | Silence. Legitimate ending.   | High       |
 | -60 to -50 dB | Near-silence. Likely OK.      | Medium     |
@@ -69,7 +68,7 @@ The Result provides raw measurements. Here are suggested interpretation guidelin
 
 ## Combining RMS and Peak
 
-| RmsDb   | PeakDb  | Interpretation                              |
+| RmsDB   | PeakDB  | Interpretation                              |
 |---------|---------|---------------------------------------------|
 | < -60   | < -60   | Clean silence. OK.                          |
 | < -60   | > -40   | Spike at end (click/glitch). Investigate.   |
@@ -80,7 +79,7 @@ The Result provides raw measurements. Here are suggested interpretation guidelin
 
 For general-purpose detection without genre context:
 
-    if FinalRmsDb > -40 && FinalPeakDb > -35 {
+    if FinalRmsDB > -40 && FinalPeakDB > -35 {
         // Likely truncated
     }
 
@@ -91,15 +90,15 @@ intentional hard endings common in electronic music.
 // TruncationDetection contains truncation results.
 type TruncationDetection struct {
 	IsTruncated   bool
-	FinalRmsDb    float64 // RMS of final window in dB
-	FinalPeakDb   float64 // Peak of final window in dB
+	FinalRmsDB    float64 // RMS of final window in dB
+	FinalPeakDB   float64 // Peak of final window in dB
 	SamplesInTail uint64
 }
 
 /*
 DC Offset Interpretation
 
-| Offset (abs) | OffsetDb | Interpretation                    |
+| Offset (abs) | OffsetDB | Interpretation                    |
 |--------------|----------|-----------------------------------|
 | < 0.001      | < -60 dB | Clean. No issues.                 |
 | 0.001-0.01   | -60 to -40 dB | Minor. Usually inaudible.    |
@@ -114,7 +113,7 @@ Negative offset = waveform shifted down.
 // DCOffsetResult contains DC offset results.
 type DCOffsetResult struct {
 	Offset   float64   // overall normalized offset (-1.0 to 1.0)
-	OffsetDb float64   // overall offset as dB (more negative = less offset)
+	OffsetDB float64   // overall offset as dB (more negative = less offset)
 	Channels []float64 // per-channel offset, normalized
 	Samples  uint64
 }
@@ -124,7 +123,7 @@ Stereo Analysis Interpretation
 
 ## Quick Diagnosis
 
-| Correlation | DifferenceDb | Diagnosis                    |
+| Correlation | DifferenceDB | Diagnosis                    |
 |-------------|--------------|------------------------------|
 | > 0.95      | < -60 dB     | Fake stereo (identical L/R)  |
 | < -0.95     | —            | Inverted phase (L = -R)      |
@@ -133,7 +132,7 @@ Stereo Analysis Interpretation
 
 ## Fake Stereo Detection
 
-| DifferenceDb | Interpretation                          |
+| DifferenceDB | Interpretation                          |
 |--------------|-----------------------------------------|
 | < -80 dB     | Identical channels. Definitely fake.    |
 | -80 to -60   | Near-identical. Fake or very narrow.    |
@@ -151,7 +150,7 @@ Stereo Analysis Interpretation
 
 ## Phase Cancellation (Mono Compatibility)
 
-| CancellationDb | Interpretation                          |
+| CancellationDB | Interpretation                          |
 |----------------|-----------------------------------------|
 | < 1 dB         | Mono-safe. Minimal cancellation.        |
 | 1-3 dB         | Minor loss in mono. Usually acceptable. |
@@ -160,7 +159,7 @@ Stereo Analysis Interpretation
 
 ## Channel Imbalance
 
-| ImbalanceDb (abs) | Interpretation                       |
+| ImbalanceDB (abs) | Interpretation                       |
 |-------------------|--------------------------------------|
 | < 0.5 dB          | Balanced. Normal.                    |
 | 0.5-1.0 dB        | Slight imbalance. Usually fine.      |
@@ -172,13 +171,13 @@ Sign: positive = left louder, negative = right louder.
 
 ## Decision Tree
 
-    if Correlation > 0.98 && DifferenceDb < -60 {
+    if Correlation > 0.98 && DifferenceDB < -60 {
         // Fake stereo
     } else if Correlation < -0.95 {
         // Inverted phase
-    } else if CancellationDb > 3 {
+    } else if CancellationDB > 3 {
         // Phase issues (mono compatibility problem)
-    } else if math.Abs(ImbalanceDb) > 2 {
+    } else if math.Abs(ImbalanceDB) > 2 {
         // Channel imbalance
     } else {
         // OK
@@ -188,13 +187,13 @@ Sign: positive = left louder, negative = right louder.
 // StereoResult contains stereo results.
 type StereoResult struct {
 	Correlation    float64 // 1.0 = identical, 0 = uncorrelated, -1.0 = inverted
-	DifferenceDb   float64 // RMS of (L-R) in dB; very negative = identical channels
-	MonoSumDb      float64 // RMS of (L+R) in dB; very negative = inverted phase
-	StereoRmsDb    float64 // RMS of original stereo signal
-	CancellationDb float64 // StereoRmsDb - MonoSumDb; positive = cancellation when summed
-	LeftRmsDb      float64 // RMS of left channel
-	RightRmsDb     float64 // RMS of right channel
-	ImbalanceDb    float64 // LeftRmsDb - RightRmsDb; positive = left louder
+	DifferenceDB   float64 // RMS of (L-R) in dB; very negative = identical channels
+	MonoSumDB      float64 // RMS of (L+R) in dB; very negative = inverted phase
+	StereoRmsDB    float64 // RMS of original stereo signal
+	CancellationDB float64 // StereoRmsDB - MonoSumDB; positive = cancellation when summed
+	LeftRmsDB      float64 // RMS of left channel
+	RightRmsDB     float64 // RMS of right channel
+	ImbalanceDB    float64 // LeftRmsDB - RightRmsDB; positive = left louder
 	Frames         uint64
 }
 
@@ -247,7 +246,7 @@ type SilenceSegment struct {
 	StartSec    float64
 	EndSec      float64
 	DurationSec float64
-	RmsDb       float64 // actual level during this segment
+	RmsDB       float64 // actual level during this segment
 }
 
 // SilenceResult aggregates all silence segments and provide high level result.
@@ -313,7 +312,7 @@ TranscodeSharpness > 50 dB/octave = obvious brick wall
 
 ## Hum Detection
 
-| HumLevelDb | Interpretation                       |
+| HumLevelDB | Interpretation                       |
 |------------|--------------------------------------|
 | < 10 dB    | Clean or negligible                  |
 | 10-20 dB   | Audible hum present                  |
@@ -325,7 +324,7 @@ TranscodeSharpness > 50 dB/octave = obvious brick wall
 
 ## Noise Floor
 
-| NoiseFloorDb | Interpretation                       |
+| NoiseFloorDB | Interpretation                       |
 |--------------|--------------------------------------|
 | < -40 dB     | Excellent, clean recording           |
 | -40 to -30   | Good, typical studio recording       |
@@ -353,7 +352,7 @@ TranscodeSharpness > 50 dB/octave = obvious brick wall
     if Has50HzHum || Has60HzHum {
         // Ground loop or equipment issue
     }
-    if NoiseFloorDb > -20 {
+    if NoiseFloorDB > -20 {
         // Investigate source quality
     }
 */
@@ -379,10 +378,10 @@ type SpectralResult struct {
 	// Hum detection
 	Has50HzHum bool
 	Has60HzHum bool
-	HumLevelDb float64 // level of worst hum relative to signal
+	HumLevelDB float64 // level of worst hum relative to signal
 
 	// Noise floor
-	NoiseFloorDb float64 // HF noise level relative to 1-10kHz
+	NoiseFloorDB float64 // HF noise level relative to 1-10kHz
 
 	// Tonal character
 	SpectralCentroid float64 // Hz; higher = brighter
@@ -408,7 +407,7 @@ True Peak / Inter-Sample Peak Interpretation
 
 ## True Peak Level (for streaming/broadcast)
 
-| TruePeakDb | Compliance                               |
+| TruePeakDB | Compliance                               |
 |------------|------------------------------------------|
 | < -2.0 dBTP| Spotify, YouTube, Apple Music safe       |
 | < -1.0 dBTP| Most streaming platforms safe            |
@@ -426,7 +425,7 @@ True Peak / Inter-Sample Peak Interpretation
 
 ## ISP Max Overshoot
 
-| ISPMaxDb   | Severity                                 |
+| ISPMaxDB   | Severity                                 |
 |------------|------------------------------------------|
 | 0-0.5 dB   | Mild clipping on sensitive DACs          |
 | 0.5-1.0 dB | Audible clipping on most DACs            |
@@ -457,10 +456,10 @@ A file can have:
 
 // TruePeakResult contains the peak analysis.
 type TruePeakResult struct {
-	TruePeakDb   float64 // max reconstructed level; > 0 = ISP present
-	SamplePeakDb float64 // max original sample level
+	TruePeakDB   float64 // max reconstructed level; > 0 = ISP present
+	SamplePeakDB float64 // max original sample level
 	ISPCount     uint64  // number of inter-sample peaks > 0 dBFS
-	ISPMaxDb     float64 // worst ISP overshoot above 0 dBFS
+	ISPMaxDB     float64 // worst ISP overshoot above 0 dBFS
 	Frames       uint64
 
 	// Enhanced ISP analysis
@@ -546,8 +545,8 @@ type LoudnessResult struct {
 	// Dynamic Range
 	DRScore int     // DR1-DR20 scale (crest factor based)
 	DRValue float64 // raw DR value before rounding
-	PeakDb  float64 // peak level used
-	RmsDb   float64 // RMS level used
+	PeakDB  float64 // peak level used
+	RmsDB   float64 // RMS level used
 
 	Frames uint64
 }
@@ -651,6 +650,6 @@ type DropoutResult struct {
 	DeltaCount   int     // sudden jumps
 	ZeroRunCount int     // zero runs
 	DCJumpCount  int     // DC offset jumps
-	WorstDb      float64 // severity of worst event in dB
+	WorstDB      float64 // severity of worst event in dB
 	Frames       uint64
 }

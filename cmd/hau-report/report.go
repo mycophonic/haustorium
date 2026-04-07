@@ -30,7 +30,15 @@ import (
 	"github.com/farcloser/haustorium/internal/types"
 )
 
-const outputFile = "haustorium-report.jsonl"
+const (
+	outputFile = "haustorium-report.jsonl"
+
+	secondsPerMinute     = 60
+	microsecondsPerMilli = 1000.0
+
+	errFmtQuotedWrap = "%q: %w"
+	errFmtIntWrap    = "%d: %w"
+)
 
 var (
 	errNotDirectory      = errors.New("not a directory")
@@ -39,6 +47,7 @@ var (
 	errInvalidSampleRate = errors.New("invalid sample rate")
 	errInvalidChannels   = errors.New("invalid channel count")
 	errInvalidBitDepth   = errors.New("must be 16, 24, or 32")
+	errReportArgs        = errors.New("expected exactly one argument: folder path")
 )
 
 func reportCommand() *cli.Command {
@@ -65,7 +74,7 @@ func reportCommand() *cli.Command {
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.NArg() != 1 {
-				return errors.New("expected exactly one argument: folder path")
+				return errReportArgs
 			}
 
 			folder := cmd.Args().First()
@@ -80,10 +89,16 @@ func reportCommand() *cli.Command {
 	}
 }
 
-func runReport(ctx context.Context, folder string, redact bool, sourceOverride string, workers int) error {
+func runReport(
+	ctx context.Context,
+	folder string,
+	redact bool,
+	sourceOverride string,
+	workers int,
+) error { //nolint:flag-parameter // redact is a simple toggle from CLI flag
 	info, err := os.Stat(folder)
 	if err != nil || !info.IsDir() {
-		return fmt.Errorf("%q: %w", folder, errNotDirectory)
+		return fmt.Errorf(errFmtQuotedWrap, folder, errNotDirectory)
 	}
 
 	// Collect audio files.
@@ -93,7 +108,7 @@ func runReport(ctx context.Context, folder string, redact bool, sourceOverride s
 	}
 
 	if len(files) == 0 {
-		return fmt.Errorf("%q: %w", folder, errNoAudioFiles)
+		return fmt.Errorf(errFmtQuotedWrap, folder, errNoAudioFiles)
 	}
 
 	fmt.Fprintf(os.Stderr, "Found %d files to analyze (%d workers)\n", len(files), workers)
@@ -162,7 +177,9 @@ func runReport(ctx context.Context, folder string, redact bool, sourceOverride s
 		}
 	}
 
-	out.Close()
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("closing output file: %w", err)
+	}
 
 	// Compress.
 	if err := compressFile(outputFile); err != nil {
@@ -171,7 +188,7 @@ func runReport(ctx context.Context, folder string, redact bool, sourceOverride s
 
 	elapsed := time.Since(startTime)
 	minutes := int(elapsed.Minutes())
-	seconds := int(elapsed.Seconds()) % 60
+	seconds := int(elapsed.Seconds()) % secondsPerMinute
 
 	fmt.Fprintf(os.Stderr, "\nDone: %d files in %dm %ds (%d failed)\n", len(files), minutes, seconds, failed)
 	fmt.Fprintf(os.Stderr, "Report written to %s (and %s.gz)\n", outputFile, outputFile)
@@ -179,7 +196,7 @@ func runReport(ctx context.Context, folder string, redact bool, sourceOverride s
 	// Timing breakdown.
 	analyzed := len(files) - failed
 
-	fmt.Fprintf(os.Stderr, "\n--- Timing ---\n")
+	fmt.Fprint(os.Stderr, "\n--- Timing ---\n")
 	fmt.Fprintf(os.Stderr, "  Wall clock:  %s\n", elapsed.Truncate(time.Millisecond))
 	fmt.Fprintf(os.Stderr, "  ffprobe:     %s (cumulative)\n", totalProbe.Truncate(time.Millisecond))
 	fmt.Fprintf(os.Stderr, "  ffmpeg:      %s (cumulative)\n", totalDecode.Truncate(time.Millisecond))
@@ -294,7 +311,7 @@ func processFile(ctx context.Context, filePath, sourceOverride string) Record {
 }
 
 func durationMs(d time.Duration) float64 {
-	return float64(d.Microseconds()) / 1000.0
+	return float64(d.Microseconds()) / microsecondsPerMilli
 }
 
 func millisToDuration(ms float64) time.Duration {
@@ -329,17 +346,17 @@ func findAudioStream(result *ffprobe.Result) (*ffprobe.Stream, error) {
 func buildPCMFormat(stream *ffprobe.Stream) (types.PCMFormat, error) {
 	sampleRate, err := strconv.Atoi(stream.SampleRate)
 	if err != nil || sampleRate <= 0 {
-		return types.PCMFormat{}, fmt.Errorf("%q: %w", stream.SampleRate, errInvalidSampleRate)
+		return types.PCMFormat{}, fmt.Errorf(errFmtQuotedWrap, stream.SampleRate, errInvalidSampleRate)
 	}
 
 	if stream.Channels <= 0 {
-		return types.PCMFormat{}, fmt.Errorf("%d: %w", stream.Channels, errInvalidChannels)
+		return types.PCMFormat{}, fmt.Errorf(errFmtIntWrap, stream.Channels, errInvalidChannels)
 	}
 
 	return types.PCMFormat{
 		SampleRate:       sampleRate,
 		BitDepth:         types.Depth32,
-		Channels:         uint(stream.Channels), //nolint:gosec // validated positive value
+		Channels:         uint(stream.Channels),
 		ExpectedBitDepth: resolveExpectedBitDepth(stream),
 	}, nil
 }
@@ -362,16 +379,22 @@ func resolveExpectedBitDepth(stream *ffprobe.Stream) types.BitDepth {
 	return types.Depth32
 }
 
+const (
+	bitDepth16 = 16
+	bitDepth24 = 24
+	bitDepth32 = 32
+)
+
 func toBitDepth(bits int) (types.BitDepth, error) {
 	switch bits {
-	case 16:
+	case bitDepth16:
 		return types.Depth16, nil
-	case 24:
+	case bitDepth24:
 		return types.Depth24, nil
-	case 32:
+	case bitDepth32:
 		return types.Depth32, nil
 	default:
-		return 0, fmt.Errorf("%d: %w", bits, errInvalidBitDepth)
+		return 0, fmt.Errorf(errFmtIntWrap, bits, errInvalidBitDepth)
 	}
 }
 
@@ -409,7 +432,7 @@ func compressFile(path string) error {
 		return err
 	}
 
-	gzFile, err := os.Create(path + ".gz")
+	gzFile, err := os.Create(path + ".gz") //nolint:gosec // path is constructed from our own output file constant
 	if err != nil {
 		return err
 	}

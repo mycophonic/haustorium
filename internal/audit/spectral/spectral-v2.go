@@ -1,4 +1,3 @@
-//nolint:staticcheck // too dumb with Db
 package spectral
 
 import (
@@ -7,18 +6,59 @@ import (
 
 	"gonum.org/v1/gonum/dsp/fourier"
 
+	"github.com/farcloser/haustorium/internal/audit/shared"
 	"github.com/farcloser/haustorium/internal/types"
+)
+
+// V2-specific detection constants.
+const (
+	// Hum V2 variance threshold: coefficient of variation below this indicates hum.
+	humMaxVariance = 0.3
+
+	// Noise floor V2 constants.
+	quietWindowFraction = 5     // denominator: use 1/5 (20%) quietest windows
+	quietGateDBFS       = -50.0 // RMS gate for quiet-window selection
+	noiseFlatnessCap    = -40   // dB cap when HF is tonal (not noise)
+	nyquistGuardHz      = 500   // guard band below Nyquist for HF measurement
+
+	// Transcode V2 confidence parameters.
+	transcodeBaseConfidence     = 0.95
+	transcodeMinConfidence      = 0.50
+	transcodeConsistencyHz      = 50   // stddev below this suggests mastering filter
+	transcodeConsistencyPenalty = 0.20 // max confidence reduction for consistency
+	transcodeUltrasonicPenalty  = 0.40 // confidence reduction for ultrasonic content
+	transcodeHFPenalty          = 0.10 // confidence reduction for high cutoff frequency
+	transcodeHFThresholdHz      = 20000
+	transcodeHFRangeHz          = 5000
+	transcodeSharpnessPenalty   = 0.10 // confidence reduction for moderate sharpness
+	transcodeV2SharpnessFloor   = 40   // sharpness below this is moderate
+
+	// Cutoff consistency measurement.
+	cutoffSearchRangeHz = 2000 // search +/- 2 kHz around target cutoff
+	cutoffMinDropDB     = 5    // minimum drop to count as meaningful
+	cutoffMinWindows    = 3    // minimum windows for consistency measurement
+
+	// Ultrasonic content detection.
+	ultrasonicOffsetHz   = 500 // offset above cutoff for ultrasonic check
+	ultrasonicRelativeDB = -50 // threshold relative to reference level
+
+	// Default coefficient of variation for no-data case.
+	defaultCV = 1.0
+
+	// Confidence clamping bounds.
+	confidenceMin = 0.0
+	confidenceMax = 1.0
 )
 
 // AnalyzeV2 adds temporal variance analysis to reduce false positives for hum
 // and noise floor detection on legitimately dark or bass-heavy recordings.
 func AnalyzeV2(reader io.Reader, format types.PCMFormat, opts Options) (*types.SpectralResult, error) {
 	if opts.FFTSize == 0 {
-		opts.FFTSize = 8192
+		opts.FFTSize = defaultFFTSize
 	}
 
 	if opts.WindowsMax == 0 {
-		opts.WindowsMax = 100
+		opts.WindowsMax = defaultWindowsMax
 	}
 
 	fftSize := opts.FFTSize
@@ -49,15 +89,69 @@ func AnalyzeV2(reader io.Reader, format types.PCMFormat, opts Options) (*types.S
 	}
 
 	// Phase 3: Process FFT windows, keeping per-window data for variance analysis.
-	window := makeHannWindow(fftSize)
+	windowMagnitudes, windowRMS, magnitudeSum := processFFTWindows(samples, positions, fftSize)
+	windowsProcessed := len(positions)
+
+	// Average magnitude spectrum.
 	binCount := fftSize/2 + 1
-	magnitudeSum := make([]float64, binCount)
+
+	avgMagnitude := make([]float64, binCount)
+	for i := range avgMagnitude {
+		avgMagnitude[i] = magnitudeSum[i] / float64(windowsProcessed)
+	}
+
+	binHz := float64(format.SampleRate) / float64(fftSize)
+	nyquist := float64(format.SampleRate) / 2
+
+	magDB := toDB(avgMagnitude)
+
+	// Reference level: 1-10 kHz average.
+	refLevel := bandAverage(magDB, refBandStartHz, refBandEndHz, binHz)
+
+	result := &types.SpectralResult{
+		ClaimedRate: format.SampleRate,
+		Frames:      totalFrames,
+	}
+
+	// === Sample rate authenticity ===
+	if format.SampleRate > minUpsampleRate {
+		detectUpsampling(result, magDB, binHz, nyquist, refLevel)
+	}
+
+	// === Lossy transcode detection V2 (with consistency analysis) ===
+	detectTranscodeV2(result, windowMagnitudes, magDB, binHz, nyquist, refLevel)
+
+	// === Hum detection V2 (with variance) ===
+	detectHumV2(result, windowMagnitudes, binHz)
+
+	// === Noise floor V2 (quiet-window HF + full-track reference + RMS gate) ===
+	detectNoiseFloorV2(result, windowMagnitudes, windowRMS, magDB, binHz, nyquist, refLevel, opts)
+
+	// === Spectral centroid ===
+	result.SpectralCentroid = calculateCentroid(avgMagnitude, binHz)
+
+	// === Band energy for debugging ===
+	result.BandEnergy, result.BandFreqs = calculateBandEnergy(magDB, binHz, nyquist, refLevel)
+
+	return result, nil
+}
+
+// processFFTWindows computes per-window magnitudes, RMS, and the magnitude sum.
+func processFFTWindows(
+	samples []float64, positions []int, fftSize int,
+) (
+	windowMagnitudes [][]float64,
+	windowRMS []float64,
+	magnitudeSum []float64,
+) {
+	binCount := fftSize/2 + 1
+	magnitudeSum = make([]float64, binCount)
+	window := makeHannWindow(fftSize)
 	fft := fourier.NewFFT(fftSize)
 	fftIn := make([]float64, fftSize)
 
-	// Per-window storage for variance analysis.
-	windowMagnitudes := make([][]float64, len(positions))
-	windowRMS := make([]float64, len(positions)) // overall RMS per window for quiet detection
+	windowMagnitudes = make([][]float64, len(positions))
+	windowRMS = make([]float64, len(positions))
 
 	for windowIdx, pos := range positions {
 		var rmsSum float64
@@ -80,69 +174,26 @@ func AnalyzeV2(reader io.Reader, format types.PCMFormat, opts Options) (*types.S
 		}
 	}
 
-	windowsProcessed := len(positions)
-
-	// Average magnitude spectrum.
-	avgMagnitude := make([]float64, binCount)
-	for i := range avgMagnitude {
-		avgMagnitude[i] = magnitudeSum[i] / float64(windowsProcessed)
-	}
-
-	binHz := float64(format.SampleRate) / float64(fftSize)
-	nyquist := float64(format.SampleRate) / 2
-
-	magDb := toDb(avgMagnitude)
-
-	// Reference level: 1-10 kHz average.
-	refLevel := bandAverage(magDb, 1000, 10000, binHz)
-
-	result := &types.SpectralResult{
-		ClaimedRate: format.SampleRate,
-		Frames:      totalFrames,
-	}
-
-	// === Sample rate authenticity ===
-	if format.SampleRate > 44100 {
-		detectUpsampling(result, magDb, binHz, nyquist, refLevel)
-	}
-
-	// === Lossy transcode detection V2 (with consistency analysis) ===
-	detectTranscodeV2(result, windowMagnitudes, magDb, binHz, nyquist, refLevel)
-
-	// === Hum detection V2 (with variance) ===
-	detectHumV2(result, windowMagnitudes, binHz, refLevel)
-
-	// === Noise floor V2 (quiet-window HF + full-track reference + RMS gate) ===
-	detectNoiseFloorV2(result, windowMagnitudes, windowRMS, magDb, binHz, nyquist, refLevel, opts)
-
-	// === Spectral centroid ===
-	result.SpectralCentroid = calculateCentroid(avgMagnitude, binHz)
-
-	// === Band energy for debugging ===
-	result.BandEnergy, result.BandFreqs = calculateBandEnergy(magDb, binHz, nyquist, refLevel)
-
-	return result, nil
+	return windowMagnitudes, windowRMS, magnitudeSum
 }
 
 // detectHumV2 checks for hum by analyzing temporal variance.
 // Real hum is constant; musical content at 50/60 Hz varies with the performance.
-func detectHumV2(result *types.SpectralResult, windowMagnitudes [][]float64, binHz, refLevel float64) {
-	hum50, variance50 := detectHumFrequencyV2(windowMagnitudes, 50, binHz)
-	hum60, variance60 := detectHumFrequencyV2(windowMagnitudes, 60, binHz)
+func detectHumV2(result *types.SpectralResult, windowMagnitudes [][]float64, binHz float64) {
+	hum50, variance50 := detectHumFrequencyV2(windowMagnitudes, humFreq50Hz, binHz)
+	hum60, variance60 := detectHumFrequencyV2(windowMagnitudes, humFreq60Hz, binHz)
 
-	// Hum = high level + low variance (coefficient of variation < 0.3)
+	// Hum = high level + low variance (coefficient of variation < humMaxVariance)
 	// Music = high level + high variance
-	const maxVarianceForHum = 0.3
-
-	if hum50 > 15 && variance50 < maxVarianceForHum {
+	if hum50 > humSpikeThreshold && variance50 < humMaxVariance {
 		result.Has50HzHum = true
-		result.HumLevelDb = hum50
+		result.HumLevelDB = hum50
 	}
 
-	if hum60 > 15 && variance60 < maxVarianceForHum {
+	if hum60 > humSpikeThreshold && variance60 < humMaxVariance {
 		result.Has60HzHum = true
-		if hum60 > result.HumLevelDb {
-			result.HumLevelDb = hum60
+		if hum60 > result.HumLevelDB {
+			result.HumLevelDB = hum60
 		}
 	}
 }
@@ -150,88 +201,109 @@ func detectHumV2(result *types.SpectralResult, windowMagnitudes [][]float64, bin
 // detectHumFrequencyV2 returns the spike level and coefficient of variation across windows.
 func detectHumFrequencyV2(windowMagnitudes [][]float64, fundamental, binHz float64) (spike, coeffVar float64) {
 	if len(windowMagnitudes) == 0 {
-		return 0, 1
+		return 0, defaultCV
 	}
-
-	harmonics := []float64{1, 2, 3, 4, 5, 6}
 
 	// For each window, compute the max spike across harmonics.
 	windowSpikes := make([]float64, len(windowMagnitudes))
 
 	for windowIdx, mag := range windowMagnitudes {
-		magDb := toDb(mag)
-
-		var maxSpike float64
-
-		for _, harmonic := range harmonics {
-			freq := fundamental * harmonic
-			bin := int(freq / binHz)
-
-			if bin <= 5 || bin >= len(magDb)-5 {
-				continue
-			}
-
-			peakLevel := magDb[bin]
-
-			var surroundSum float64
-
-			surroundCount := 0
-
-			for idx := bin - 5; idx <= bin+5; idx++ {
-				if idx >= 0 && idx < len(magDb) && (idx < bin-1 || idx > bin+1) {
-					surroundSum += magDb[idx]
-					surroundCount++
-				}
-			}
-
-			if surroundCount > 0 {
-				surroundAvg := surroundSum / float64(surroundCount)
-				spikeLevel := peakLevel - surroundAvg
-
-				// Peak sharpness: reject broad spectral bumps (synth bass, kick)
-				// that are not genuine tonal spikes.
-				if bin >= 1 && bin < len(magDb)-1 {
-					adjacentAvg := (magDb[bin-1] + magDb[bin+1]) / 2
-					if peakLevel-adjacentAvg < 6 {
-						continue
-					}
-				}
-
-				if spikeLevel > maxSpike {
-					maxSpike = spikeLevel
-				}
-			}
-		}
-
-		windowSpikes[windowIdx] = maxSpike
+		magDB := toDB(mag)
+		windowSpikes[windowIdx] = measureMaxHumSpikeV2(magDB, fundamental, binHz)
 	}
 
 	// Compute mean and standard deviation of spikes across windows.
-	var sum float64
-	for _, s := range windowSpikes {
-		sum += s
-	}
-
-	mean := sum / float64(len(windowSpikes))
-
-	var varianceSum float64
-
-	for _, s := range windowSpikes {
-		d := s - mean
-		varianceSum += d * d
-	}
-
-	stdDev := math.Sqrt(varianceSum / float64(len(windowSpikes)))
+	mean, stdDev := meanStdDev(windowSpikes)
 
 	// Coefficient of variation (stdDev / mean).
 	// Low CV = consistent level = hum.
 	// High CV = varying level = music.
-	cv := 1.0
+	cv := defaultCV
 	if mean > 0 {
 		cv = stdDev / mean
 	}
 
 	return mean, cv
+}
+
+// measureMaxHumSpikeV2 finds the maximum hum spike across harmonics for a single window.
+func measureMaxHumSpikeV2(magDB []float64, fundamental, binHz float64) float64 {
+	var maxSpike float64
+
+	for harmonic := firstHarmonic; harmonic <= humHarmonicCount; harmonic++ {
+		freq := fundamental * harmonic
+		bin := int(freq / binHz)
+
+		if bin <= humAdjacentRange || bin >= len(magDB)-humAdjacentRange {
+			continue
+		}
+
+		spike := measureHumSpikeV2(magDB, bin)
+		if spike > maxSpike {
+			maxSpike = spike
+		}
+	}
+
+	return maxSpike
+}
+
+// measureHumSpikeV2 measures the spectral spike at a given bin with sharpness filtering.
+func measureHumSpikeV2(magDB []float64, bin int) float64 {
+	peakLevel := magDB[bin]
+
+	var surroundSum float64
+
+	surroundCount := 0
+
+	for idx := bin - humAdjacentRange; idx <= bin+humAdjacentRange; idx++ {
+		if idx >= 0 && idx < len(magDB) && (idx < bin-1 || idx > bin+1) {
+			surroundSum += magDB[idx]
+			surroundCount++
+		}
+	}
+
+	if surroundCount == 0 {
+		return 0
+	}
+
+	surroundAvg := surroundSum / float64(surroundCount)
+	spikeLevel := peakLevel - surroundAvg
+
+	// Peak sharpness: reject broad spectral bumps (synth bass, kick)
+	// that are not genuine tonal spikes.
+	if bin >= 1 && bin < len(magDB)-1 {
+		adjacentAvg := (magDB[bin-1] + magDB[bin+1]) / 2
+		if peakLevel-adjacentAvg < humSharpnessMin {
+			return 0
+		}
+	}
+
+	return spikeLevel
+}
+
+// meanStdDev computes the mean and standard deviation of a slice.
+func meanStdDev(values []float64) (mean, stdDev float64) {
+	if len(values) == 0 {
+		return 0, 0
+	}
+
+	var sum float64
+	for _, v := range values {
+		sum += v
+	}
+
+	mean = sum / float64(len(values))
+
+	var varianceSum float64
+
+	for _, v := range values {
+		d := v - mean
+		varianceSum += d * d
+	}
+
+	stdDev = math.Sqrt(varianceSum / float64(len(values)))
+
+	return mean, stdDev
 }
 
 // detectNoiseFloorV2 measures noise floor using quiet-window HF with full-track reference,
@@ -248,38 +320,65 @@ func detectNoiseFloorV2(
 	result *types.SpectralResult,
 	windowMagnitudes [][]float64,
 	windowRMS []float64,
-	magDb []float64,
+	magDB []float64,
 	binHz, nyquist, refLevel float64,
 	opts Options,
 ) {
 	if len(windowMagnitudes) == 0 {
-		result.NoiseFloorDb = -120
+		result.NoiseFloorDB = shared.SilenceFloorDB
 
 		return
 	}
 
 	// HF band boundaries.
 	binCount := len(windowMagnitudes[0])
-	hfStart := int(14000 / binHz)
-	hfEnd := int(min(18000, nyquist-500) / binHz)
+	hfStart := int(nfBandStartHz / binHz)
+	hfEnd := int(min(float64(nfBandEndHz), nyquist-nyquistGuardHz) / binHz)
 
 	if hfStart >= binCount || hfEnd <= hfStart {
-		result.NoiseFloorDb = -120
+		result.NoiseFloorDB = shared.SilenceFloorDB
 
 		return
 	}
 
 	// Find the quietest 20% of windows (or at least 1).
-	quietCount := max(len(windowRMS)/5, 1)
+	quietCount := max(len(windowRMS)/quietWindowFraction, 1)
 	quietIndices := findQuietestWindows(windowRMS, quietCount)
 
-	// RMS gate: check if quiet windows have enough signal for meaningful measurement.
-	// Below -50 dBFS, we're in recording-medium noise territory (dither, ADC noise)
-	// where the HF measurement reflects the medium, not a quality problem.
-	// Above -50 dBFS, quiet passages still contain enough musical signal for the
-	// quiet-window HF measurement to be more accurate than the full-track average.
-	const quietGateDbFS = -50.0
+	useQuietWindows := isQuietWindowUsable(windowRMS, quietIndices)
 
+	var hfDB float64
+
+	if useQuietWindows {
+		hfDB = measureQuietWindowHF(windowMagnitudes, quietIndices, hfStart, hfEnd, refLevel)
+	} else {
+		// Quiet windows still contain signal - fall back to full-track HF.
+		hfLevel := bandAverage(magDB, nfBandStartHz, nfBandEndHz, binHz)
+		hfDB = hfLevel - refLevel
+	}
+
+	result.NoiseFloorDB = hfDB
+
+	// Spectral flatness guard: only flag if HF energy is spectrally flat (actual noise).
+	flatness := measureQuietHFFlatness(windowMagnitudes, quietIndices, hfStart, hfEnd)
+	if !useQuietWindows {
+		flatness = measureFullTrackHFFlatness(windowMagnitudes, hfStart, hfEnd)
+	}
+
+	flatnessCutoff := opts.NoiseFlatnessCutoff
+	if flatnessCutoff == 0 {
+		flatnessCutoff = defaultNoiseFlatnessCutoff
+	}
+
+	if flatness < flatnessCutoff {
+		// Not flat enough to be noise; likely just dark recording.
+		// Cap the reported level below the mild threshold to avoid false positive.
+		result.NoiseFloorDB = min(hfDB, noiseFlatnessCap)
+	}
+}
+
+// isQuietWindowUsable checks if the quiet windows are genuinely quiet (below the RMS gate).
+func isQuietWindowUsable(windowRMS []float64, quietIndices []int) bool {
 	var quietRMSSum float64
 	for _, wi := range quietIndices {
 		quietRMSSum += windowRMS[wi]
@@ -287,87 +386,79 @@ func detectNoiseFloorV2(
 
 	avgQuietRMS := quietRMSSum / float64(len(quietIndices))
 
-	quietRMSDb := -120.0
+	quietRMSDB := shared.SilenceFloorDB
 	if avgQuietRMS > 0 {
-		quietRMSDb = 20 * math.Log10(avgQuietRMS)
+		quietRMSDB = float64(shared.DBMultiplier) * math.Log10(avgQuietRMS)
 	}
 
-	useQuietWindows := quietRMSDb > quietGateDbFS
+	return quietRMSDB > quietGateDBFS
+}
 
-	var hfDb float64
+// measureQuietWindowHF measures HF energy from the quietest windows.
+func measureQuietWindowHF(
+	windowMagnitudes [][]float64, quietIndices []int,
+	hfStart, hfEnd int, refLevel float64,
+) float64 {
+	var hfSum float64
 
-	if useQuietWindows {
-		// Quiet windows are genuinely quiet — measure HF from them.
-		var hfSum float64
+	hfBins := hfEnd - hfStart
 
-		hfBins := hfEnd - hfStart
+	for _, wi := range quietIndices {
+		mag := windowMagnitudes[wi]
 
-		for _, wi := range quietIndices {
-			mag := windowMagnitudes[wi]
-
-			var bandSum float64
-			for i := hfStart; i < hfEnd && i < len(mag); i++ {
-				bandSum += mag[i]
-			}
-
-			hfSum += bandSum / float64(hfBins)
+		var bandSum float64
+		for i := hfStart; i < hfEnd && i < len(mag); i++ {
+			bandSum += mag[i]
 		}
 
-		avgHF := hfSum / float64(len(quietIndices))
-
-		hfDb = -120.0
-		if avgHF > 0 {
-			hfDb = 20*math.Log10(avgHF) - refLevel
-		}
-	} else {
-		// Quiet windows still contain signal — fall back to full-track HF.
-		hfLevel := bandAverage(magDb, 14000, 18000, binHz)
-		hfDb = hfLevel - refLevel
+		hfSum += bandSum / float64(hfBins)
 	}
 
-	result.NoiseFloorDb = hfDb
+	avgHF := hfSum / float64(len(quietIndices))
 
-	// Spectral flatness guard: only flag if HF energy is spectrally flat (actual noise).
-	// Computed from quiet windows when available, full-track magnitudes otherwise.
-	var flatness float64
-
-	if useQuietWindows {
-		var flatnessSum float64
-
-		for _, wi := range quietIndices {
-			mag := windowMagnitudes[wi]
-			flatnessSum += spectralFlatness(mag[hfStart:min(hfEnd, len(mag))])
-		}
-
-		flatness = flatnessSum / float64(len(quietIndices))
-	} else {
-		// Full-track average magnitude for flatness.
-		avgMag := make([]float64, binCount)
-
-		for _, wm := range windowMagnitudes {
-			for i := hfStart; i < hfEnd && i < len(wm); i++ {
-				avgMag[i] += wm[i]
-			}
-		}
-
-		wc := float64(len(windowMagnitudes))
-		for i := hfStart; i < hfEnd && i < len(avgMag); i++ {
-			avgMag[i] /= wc
-		}
-
-		flatness = spectralFlatness(avgMag[hfStart:min(hfEnd, binCount)])
+	hfDB := shared.SilenceFloorDB
+	if avgHF > 0 {
+		hfDB = float64(shared.DBMultiplier)*math.Log10(avgHF) - refLevel
 	}
 
-	flatnessCutoff := opts.NoiseFlatnessCutoff
-	if flatnessCutoff == 0 {
-		flatnessCutoff = 0.4
+	return hfDB
+}
+
+// measureQuietHFFlatness computes spectral flatness of the HF band from quiet windows.
+func measureQuietHFFlatness(
+	windowMagnitudes [][]float64, quietIndices []int,
+	hfStart, hfEnd int,
+) float64 {
+	var flatnessSum float64
+
+	for _, wi := range quietIndices {
+		mag := windowMagnitudes[wi]
+		flatnessSum += spectralFlatness(mag[hfStart:min(hfEnd, len(mag))])
 	}
 
-	if flatness < flatnessCutoff {
-		// Not flat enough to be noise; likely just dark recording.
-		// Cap the reported level below the mild threshold to avoid false positive.
-		result.NoiseFloorDb = min(hfDb, -40)
+	return flatnessSum / float64(len(quietIndices))
+}
+
+// measureFullTrackHFFlatness computes spectral flatness of the HF band from all windows.
+func measureFullTrackHFFlatness(
+	windowMagnitudes [][]float64,
+	hfStart, hfEnd int,
+) float64 {
+	binCount := len(windowMagnitudes[0])
+	avgMag := make([]float64, binCount)
+
+	for _, wm := range windowMagnitudes {
+		for i := hfStart; i < hfEnd && i < len(wm); i++ {
+			avgMag[i] += wm[i]
+		}
 	}
+
+	wc := float64(len(windowMagnitudes))
+	for i := hfStart; i < hfEnd && i < len(avgMag); i++ {
+		avgMag[i] /= wc
+	}
+
+	return spectralFlatness(avgMag[hfStart:min(hfEnd, binCount)])
 }
 
 // findQuietestWindows returns indices of the N quietest windows by RMS.
@@ -458,11 +549,11 @@ func spectralFlatness(magnitudes []float64) float64 {
 func detectTranscodeV2(
 	result *types.SpectralResult,
 	windowMagnitudes [][]float64,
-	magDb []float64,
+	magDB []float64,
 	binHz, nyquist, refLevel float64,
 ) {
 	// First, run the basic detection to find candidate cutoffs.
-	detectTranscode(result, magDb, binHz, nyquist, refLevel)
+	detectTranscode(result, magDB, binHz, nyquist, refLevel)
 
 	// If no transcode detected, nothing more to do.
 	if !result.IsTranscode {
@@ -472,63 +563,44 @@ func detectTranscodeV2(
 	}
 
 	// Start with high confidence, reduce based on evidence.
-	confidence := 0.95
+	confidence := transcodeBaseConfidence
 	cutoffFreq := result.TranscodeCutoff
 
 	// === Check 1: Cutoff consistency across windows ===
-	// A mastering LPF creates identical cutoffs in every window.
-	// A codec's psychoacoustic model may cause slight variations.
 	cutoffStdDev := measureCutoffConsistency(windowMagnitudes, cutoffFreq, binHz)
 	result.CutoffConsistency = cutoffStdDev
 
-	// Very low stddev (< 50 Hz) suggests mastering filter, not codec.
-	// Reduce confidence proportionally.
-	if cutoffStdDev < 50 {
-		// Linear reduction: 0 Hz stddev -> -0.20 confidence, 50 Hz -> 0
-		reduction := 0.20 * (1 - cutoffStdDev/50)
+	// Very low stddev suggests mastering filter, not codec.
+	if cutoffStdDev < transcodeConsistencyHz {
+		reduction := transcodeConsistencyPenalty * (1 - cutoffStdDev/transcodeConsistencyHz)
 		confidence -= reduction
 	}
 
 	// === Check 2: Ultrasonic content above cutoff ===
-	// Legitimate mastering often leaves faint ultrasonic content (harmonics, dither).
-	// Lossy codecs completely eliminate everything above their cutoff.
-	// This is the strongest indicator: codecs create a hard wall with NOTHING above.
-	hasUltrasonic := checkUltrasonicContent(magDb, cutoffFreq, binHz, nyquist, refLevel)
+	hasUltrasonic := checkUltrasonicContent(magDB, cutoffFreq, binHz, nyquist, refLevel)
 	result.HasUltrasonicContent = hasUltrasonic
 
 	if hasUltrasonic {
-		// Content above cutoff is definitive evidence against a codec.
-		// Codecs cannot leave ultrasonic content - they completely eliminate it.
-		// This is the strongest signal we have.
-		confidence -= 0.40
+		confidence -= transcodeUltrasonicPenalty
 	}
 
 	// === Check 3: Cutoff frequency penalty for high frequencies ===
-	// Cutoffs at 20+ kHz are more likely to be mastering decisions.
-	// Lower cutoffs (15-18 kHz) are more clearly codec-related.
-	if cutoffFreq >= 20000 {
-		// 20 kHz: -0.10, 20.5 kHz: -0.15, 21 kHz: -0.20
-		reduction := 0.10 + (cutoffFreq-20000)/5000*0.10
-		confidence -= min(reduction, 0.20)
+	if cutoffFreq >= transcodeHFThresholdHz {
+		reduction := transcodeHFPenalty + (cutoffFreq-transcodeHFThresholdHz)/transcodeHFRangeHz*transcodeHFPenalty
+		confidence -= min(reduction, transcodeConsistencyPenalty)
 	}
 
 	// === Check 4: Sharpness analysis ===
-	// Mastering filters: typically 24-48 dB/octave (gentle to moderate)
-	// Codec brick walls: often 60+ dB/octave (very steep)
-	// But some mastering filters can also be steep, so this is a weak signal.
 	sharpness := result.TranscodeSharpness
-	if sharpness < 40 {
-		// Moderate slope is more consistent with mastering filter.
-		confidence -= 0.10
+	if sharpness < transcodeV2SharpnessFloor {
+		confidence -= transcodeSharpnessPenalty
 	}
 
 	// Clamp confidence to valid range.
-	confidence = max(0.0, min(1.0, confidence))
+	confidence = max(confidenceMin, min(confidenceMax, confidence))
 
 	// If confidence drops below threshold, un-flag as transcode.
-	const minConfidenceThreshold = 0.50
-
-	if confidence < minConfidenceThreshold {
+	if confidence < transcodeMinConfidence {
 		result.IsTranscode = false
 		result.LikelyCodec = ""
 	}
@@ -540,21 +612,21 @@ func detectTranscodeV2(
 // Returns the standard deviation of detected cutoff frequencies.
 // Low stddev = consistent (mastering filter), high stddev = variable (possibly codec).
 func measureCutoffConsistency(windowMagnitudes [][]float64, targetCutoff, binHz float64) float64 {
-	if len(windowMagnitudes) < 3 {
+	if len(windowMagnitudes) < cutoffMinWindows {
 		return 0 // not enough windows to measure consistency
 	}
 
 	// For each window, find the frequency where energy drops most sharply
 	// in the vicinity of the target cutoff.
-	searchStart := targetCutoff - 2000 // search ±2 kHz around target
-	searchEnd := targetCutoff + 2000
+	searchStart := targetCutoff - cutoffSearchRangeHz
+	searchEnd := targetCutoff + cutoffSearchRangeHz
 	startBin := max(1, int(searchStart/binHz))
 
 	var cutoffs []float64
 
 	for _, mag := range windowMagnitudes {
-		magDb := toDb(mag)
-		endBin := min(len(magDb)-2, int(searchEnd/binHz))
+		magDB := toDB(mag)
+		endBin := min(len(magDB)-2, int(searchEnd/binHz))
 
 		if startBin >= endBin {
 			continue
@@ -568,47 +640,35 @@ func measureCutoffConsistency(windowMagnitudes [][]float64, targetCutoff, binHz 
 
 		for bin := startBin; bin < endBin; bin++ {
 			// Measure drop from bin to bin+2 (smoothed gradient).
-			drop := magDb[bin] - magDb[bin+2]
+			drop := magDB[bin] - magDB[bin+2]
 			if drop > maxDrop {
 				maxDrop = drop
 				maxDropBin = bin
 			}
 		}
 
-		if maxDrop > 5 { // only count if there's a meaningful drop
+		if maxDrop > cutoffMinDropDB { // only count if there's a meaningful drop
 			cutoffs = append(cutoffs, float64(maxDropBin)*binHz)
 		}
 	}
 
-	if len(cutoffs) < 3 {
+	if len(cutoffs) < cutoffMinWindows {
 		return 0
 	}
 
 	// Calculate standard deviation.
-	var sum float64
-	for _, c := range cutoffs {
-		sum += c
-	}
+	_, stdDev := meanStdDev(cutoffs)
 
-	mean := sum / float64(len(cutoffs))
-
-	var varianceSum float64
-
-	for _, c := range cutoffs {
-		d := c - mean
-		varianceSum += d * d
-	}
-
-	return math.Sqrt(varianceSum / float64(len(cutoffs)))
+	return stdDev
 }
 
 // checkUltrasonicContent checks if there's any meaningful content above the cutoff.
 // Legitimate mastering may leave faint harmonics, dither, or room noise above 20 kHz.
 // Lossy codecs create a hard wall with nothing above.
-func checkUltrasonicContent(magDb []float64, cutoffFreq, binHz, nyquist, refLevel float64) bool {
+func checkUltrasonicContent(magDB []float64, cutoffFreq, binHz, nyquist, refLevel float64) bool {
 	// Check energy in the band from cutoff+500 Hz to nyquist-500 Hz.
-	checkStart := cutoffFreq + 500
-	checkEnd := nyquist - 500
+	checkStart := cutoffFreq + ultrasonicOffsetHz
+	checkEnd := nyquist - ultrasonicOffsetHz
 
 	if checkEnd <= checkStart {
 		return false // no room to check
@@ -617,11 +677,11 @@ func checkUltrasonicContent(magDb []float64, cutoffFreq, binHz, nyquist, refLeve
 	startBin := int(checkStart / binHz)
 	endBin := int(checkEnd / binHz)
 
-	if startBin >= len(magDb) || endBin <= startBin {
+	if startBin >= len(magDB) || endBin <= startBin {
 		return false
 	}
 
-	endBin = min(endBin, len(magDb)-1)
+	endBin = min(endBin, len(magDB)-1)
 
 	// Calculate average energy above cutoff.
 	var sum float64
@@ -629,7 +689,7 @@ func checkUltrasonicContent(magDb []float64, cutoffFreq, binHz, nyquist, refLeve
 	count := 0
 
 	for i := startBin; i <= endBin; i++ {
-		sum += magDb[i]
+		sum += magDB[i]
 		count++
 	}
 
@@ -640,11 +700,9 @@ func checkUltrasonicContent(magDb []float64, cutoffFreq, binHz, nyquist, refLeve
 	avgAboveCutoff := sum / float64(count)
 
 	// Compare to reference level.
-	// If ultrasonic energy is within 50 dB of reference, there's content.
-	// (Pure silence/noise floor would be 60-80 dB below reference.)
+	// If ultrasonic energy is within range of reference, there's content.
 	relativeLevel := avgAboveCutoff - refLevel
 
 	// If there's meaningful content (not just noise floor), return true.
-	// Threshold: -50 dB relative to reference indicates some content.
-	return relativeLevel > -50
+	return relativeLevel > ultrasonicRelativeDB
 }
