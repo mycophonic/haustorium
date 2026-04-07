@@ -1,3 +1,4 @@
+// Package bitdepth detects zero-padded audio files masquerading as higher bit depths.
 package bitdepth
 
 import (
@@ -7,6 +8,7 @@ import (
 
 	"github.com/farcloser/primordium/fault"
 
+	"github.com/farcloser/haustorium/internal/audit/shared"
 	"github.com/farcloser/haustorium/internal/types"
 )
 
@@ -53,9 +55,11 @@ func Authenticity(reader io.Reader, format types.PCMFormat) (*types.BitDepthAuth
 			data := buf[:completeSamples]
 
 			switch format.BitDepth {
+			case types.Depth16:
+				// Depth16 is handled by the early return above.
 			case types.Depth24:
 				for i := 0; i < len(data); i += 3 {
-					sample := uint32(data[i]) | uint32(data[i+1])<<8 | uint32(data[i+2])<<16
+					sample := uint32(data[i]) | uint32(data[i+1])<<shared.Shift8 | uint32(data[i+2])<<16
 					usedBits |= sample
 					samples++
 				}
@@ -98,6 +102,9 @@ func Authenticity(reader io.Reader, format types.PCMFormat) (*types.BitDepthAuth
 
 func effectiveBitDepth(usedBits uint32, claimed types.BitDepth) types.BitDepth {
 	switch claimed {
+	case types.Depth16:
+		// Depth16 means no padding possible, return claimed.
+		return claimed
 	case types.Depth24:
 		if usedBits&genuineMask24 == 0 {
 			return types.Depth16

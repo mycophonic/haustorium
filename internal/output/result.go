@@ -39,8 +39,8 @@ func ResultToMap(result *haustorium.Result) map[string]any {
 
 	if r := result.Truncation; r != nil {
 		meta["truncation"] = map[string]any{
-			"final_rms_db":    r.FinalRmsDb,
-			"final_peak_db":   r.FinalPeakDb,
+			"final_rms_db":    r.FinalRmsDB,
+			"final_peak_db":   r.FinalPeakDB,
 			"samples_in_tail": r.SamplesInTail,
 		}
 	}
@@ -61,7 +61,7 @@ func ResultToMap(result *haustorium.Result) map[string]any {
 	if r := result.DCOffset; r != nil {
 		meta["dc_offset"] = map[string]any{
 			"offset":    r.Offset,
-			"offset_db": r.OffsetDb,
+			"offset_db": r.OffsetDB,
 			"channels":  r.Channels,
 			"samples":   r.Samples,
 		}
@@ -70,13 +70,13 @@ func ResultToMap(result *haustorium.Result) map[string]any {
 	if reader := result.Stereo; reader != nil {
 		meta["stereo"] = map[string]any{
 			"correlation":     reader.Correlation,
-			"difference_db":   reader.DifferenceDb,
-			"mono_sum_db":     reader.MonoSumDb,
-			"stereo_rms_db":   reader.StereoRmsDb,
-			"cancellation_db": reader.CancellationDb,
-			"left_rms_db":     reader.LeftRmsDb,
-			"right_rms_db":    reader.RightRmsDb,
-			"imbalance_db":    reader.ImbalanceDb,
+			"difference_db":   reader.DifferenceDB,
+			"mono_sum_db":     reader.MonoSumDB,
+			"stereo_rms_db":   reader.StereoRmsDB,
+			"cancellation_db": reader.CancellationDB,
+			"left_rms_db":     reader.LeftRmsDB,
+			"right_rms_db":    reader.RightRmsDB,
+			"imbalance_db":    reader.ImbalanceDB,
 			"frames":          reader.Frames,
 		}
 	}
@@ -87,10 +87,10 @@ func ResultToMap(result *haustorium.Result) map[string]any {
 
 	if reader := result.TruePeak; reader != nil {
 		meta["true_peak"] = map[string]any{
-			"true_peak_db":       reader.TruePeakDb,
-			"sample_peak_db":     reader.SamplePeakDb,
+			"true_peak_db":       reader.TruePeakDB,
+			"sample_peak_db":     reader.SamplePeakDB,
 			"isp_count":          reader.ISPCount,
-			"isp_max_db":         reader.ISPMaxDb,
+			"isp_max_db":         reader.ISPMaxDB,
 			"isp_density_peak":   reader.ISPDensityPeak,
 			"isp_density_avg":    reader.ISPDensityAvg,
 			"isps_above_half_db": reader.ISPsAboveHalfdB,
@@ -109,8 +109,8 @@ func ResultToMap(result *haustorium.Result) map[string]any {
 			"loudness_range":  reader.LoudnessRange,
 			"dr_score":        reader.DRScore,
 			"dr_value":        reader.DRValue,
-			"peak_db":         reader.PeakDb,
-			"rms_db":          reader.RmsDb,
+			"peak_db":         reader.PeakDB,
+			"rms_db":          reader.RmsDB,
 			"frames":          reader.Frames,
 		}
 	}
@@ -151,8 +151,8 @@ func SpectralToMap(result *types.SpectralResult) map[string]any {
 		"is_transcode":      result.IsTranscode,
 		"has_50hz_hum":      result.Has50HzHum,
 		"has_60hz_hum":      result.Has60HzHum,
-		"hum_level_db":      result.HumLevelDb,
-		"noise_floor_db":    result.NoiseFloorDb,
+		"hum_level_db":      result.HumLevelDB,
+		"noise_floor_db":    result.NoiseFloorDB,
 		"spectral_centroid": result.SpectralCentroid,
 		"frames":            result.Frames,
 	}
@@ -199,7 +199,7 @@ func SilenceToMap(result *types.SilenceResult) map[string]any {
 			"start_sec":    seg.StartSec,
 			"end_sec":      seg.EndSec,
 			"duration_sec": seg.DurationSec,
-			"rms_db":       seg.RmsDb,
+			"rms_db":       seg.RmsDB,
 		})
 	}
 
@@ -234,7 +234,7 @@ func DropoutToMap(result *types.DropoutResult) map[string]any {
 		"delta_count":    result.DeltaCount,
 		"zero_run_count": result.ZeroRunCount,
 		"dc_jump_count":  result.DCJumpCount,
-		"worst_db":       result.WorstDb,
+		"worst_db":       result.WorstDB,
 		"frames":         result.Frames,
 		"events":         events,
 	}

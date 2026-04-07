@@ -1,3 +1,4 @@
+// Package stereo analyzes stereo field properties of PCM audio.
 package stereo
 
 import (
@@ -12,17 +13,18 @@ import (
 	"github.com/farcloser/haustorium/internal/types"
 )
 
+// Analyze computes stereo correlation, channel balance, and mono-compatibility metrics.
 func Analyze(reader io.Reader, format types.PCMFormat) (*types.StereoResult, error) {
 	if format.Channels != 2 {
 		return &types.StereoResult{
 			Correlation:    0,
-			DifferenceDb:   0,
-			MonoSumDb:      0,
-			StereoRmsDb:    0,
-			CancellationDb: 0,
-			LeftRmsDb:      0,
-			RightRmsDb:     0,
-			ImbalanceDb:    0,
+			DifferenceDB:   0,
+			MonoSumDB:      0,
+			StereoRmsDB:    0,
+			CancellationDB: 0,
+			LeftRmsDB:      0,
+			RightRmsDB:     0,
+			ImbalanceDB:    0,
 			Frames:         0,
 		}, nil
 	}
@@ -147,13 +149,13 @@ func Analyze(reader io.Reader, format types.PCMFormat) (*types.StereoResult, err
 	if frames == 0 {
 		return &types.StereoResult{
 			Correlation:    0,
-			DifferenceDb:   -120.0,
-			MonoSumDb:      -120.0,
-			StereoRmsDb:    -120.0,
-			CancellationDb: 0,
-			LeftRmsDb:      -120.0,
-			RightRmsDb:     -120.0,
-			ImbalanceDb:    0,
+			DifferenceDB:   shared.SilenceFloorDB,
+			MonoSumDB:      shared.SilenceFloorDB,
+			StereoRmsDB:    shared.SilenceFloorDB,
+			CancellationDB: 0,
+			LeftRmsDB:      shared.SilenceFloorDB,
+			RightRmsDB:     shared.SilenceFloorDB,
+			ImbalanceDB:    0,
 			Frames:         0,
 		}, nil
 	}
@@ -176,41 +178,41 @@ func Analyze(reader io.Reader, format types.PCMFormat) (*types.StereoResult, err
 	leftRms := math.Sqrt(sumLL / count)
 	rightRms := math.Sqrt(sumRR / count)
 
-	diffDb := 20 * math.Log10(diffRms)
-	monoDb := 20 * math.Log10(monoRms)
-	stereoDb := 20 * math.Log10(stereoRms)
-	leftDb := 20 * math.Log10(leftRms)
-	rightDb := 20 * math.Log10(rightRms)
+	diffDB := shared.DBMultiplier * math.Log10(diffRms)
+	monoDB := shared.DBMultiplier * math.Log10(monoRms)
+	stereoDB := shared.DBMultiplier * math.Log10(stereoRms)
+	leftDB := shared.DBMultiplier * math.Log10(leftRms)
+	rightDB := shared.DBMultiplier * math.Log10(rightRms)
 
-	if math.IsInf(diffDb, -1) {
-		diffDb = -120.0
+	if math.IsInf(diffDB, -1) {
+		diffDB = shared.SilenceFloorDB
 	}
 
-	if math.IsInf(monoDb, -1) {
-		monoDb = -120.0
+	if math.IsInf(monoDB, -1) {
+		monoDB = shared.SilenceFloorDB
 	}
 
-	if math.IsInf(stereoDb, -1) {
-		stereoDb = -120.0
+	if math.IsInf(stereoDB, -1) {
+		stereoDB = shared.SilenceFloorDB
 	}
 
-	if math.IsInf(leftDb, -1) {
-		leftDb = -120.0
+	if math.IsInf(leftDB, -1) {
+		leftDB = shared.SilenceFloorDB
 	}
 
-	if math.IsInf(rightDb, -1) {
-		rightDb = -120.0
+	if math.IsInf(rightDB, -1) {
+		rightDB = shared.SilenceFloorDB
 	}
 
 	return &types.StereoResult{
 		Correlation:    correlation,
-		DifferenceDb:   diffDb,
-		MonoSumDb:      monoDb,
-		StereoRmsDb:    stereoDb,
-		CancellationDb: stereoDb - monoDb,
-		LeftRmsDb:      leftDb,
-		RightRmsDb:     rightDb,
-		ImbalanceDb:    leftDb - rightDb,
+		DifferenceDB:   diffDB,
+		MonoSumDB:      monoDB,
+		StereoRmsDB:    stereoDB,
+		CancellationDB: stereoDB - monoDB,
+		LeftRmsDB:      leftDB,
+		RightRmsDB:     rightDB,
+		ImbalanceDB:    leftDB - rightDB,
 		Frames:         frames,
 	}, nil
 }

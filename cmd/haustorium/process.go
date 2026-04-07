@@ -18,7 +18,12 @@ import (
 	"github.com/farcloser/haustorium/internal/types"
 )
 
-var errProcessArgs = errors.New("expected exactly one argument: file path")
+var (
+	errProcessArgs       = errors.New("expected exactly one argument: file path")
+	errStreamNotFound    = errors.New("audio stream not found")
+	errInvalidSampleRate = errors.New("invalid sample rate from probe")
+	errInvalidChannels   = errors.New("invalid channel count from probe")
+)
 
 func processCommand() *cli.Command {
 	return &cli.Command{
@@ -137,23 +142,28 @@ func findAudioStream(result *ffprobe.Result, streamIndex int) (*ffprobe.Stream, 
 		}
 	}
 
-	return nil, fmt.Errorf("audio stream index %d not found (file has %d audio streams)", streamIndex, audioCount)
+	return nil, fmt.Errorf(
+		"audio stream index %d not found (file has %d audio streams): %w",
+		streamIndex,
+		audioCount,
+		errStreamNotFound,
+	)
 }
 
 func buildPCMFormat(stream *ffprobe.Stream) (types.PCMFormat, error) {
 	sampleRate, err := strconv.Atoi(stream.SampleRate)
 	if err != nil || sampleRate <= 0 {
-		return types.PCMFormat{}, fmt.Errorf("invalid sample rate from probe: %q", stream.SampleRate)
+		return types.PCMFormat{}, fmt.Errorf("%q: %w", stream.SampleRate, errInvalidSampleRate)
 	}
 
 	if stream.Channels <= 0 {
-		return types.PCMFormat{}, fmt.Errorf("invalid channel count from probe: %d", stream.Channels)
+		return types.PCMFormat{}, fmt.Errorf("%d: %w", stream.Channels, errInvalidChannels)
 	}
 
 	return types.PCMFormat{
 		SampleRate:       sampleRate,
 		BitDepth:         types.Depth32,
-		Channels:         uint(stream.Channels), //nolint:gosec // validated positive value
+		Channels:         uint(stream.Channels),
 		ExpectedBitDepth: resolveExpectedBitDepth(stream),
 	}, nil
 }

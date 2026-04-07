@@ -12,6 +12,14 @@ import (
 	"github.com/urfave/cli/v3"
 )
 
+const (
+	severitySevere   = "severe"
+	severityModerate = "moderate"
+	severityMild     = "mild"
+)
+
+var errDigestArgs = errors.New("expected exactly one argument: path to report.jsonl")
+
 func digestCommand() *cli.Command {
 	return &cli.Command{
 		Name:      "digest",
@@ -25,7 +33,7 @@ func digestCommand() *cli.Command {
 		},
 		Action: func(_ context.Context, cmd *cli.Command) error {
 			if cmd.NArg() != 1 {
-				return errors.New("expected exactly one argument: path to report.jsonl")
+				return errDigestArgs
 			}
 
 			return runDigest(cmd.Args().First(), cmd.String("issue"))
@@ -89,14 +97,14 @@ func readRecordsWithRaw(path string) ([]digestRecord, [][]byte, error) {
 
 func printDigest(records []digestRecord) {
 	total := len(records)
-	errors := 0
-	sevDist := map[string]int{"severe": 0, "moderate": 0, "mild": 0, "clean": 0}
+	errorCount := 0
+	sevDist := map[string]int{severitySevere: 0, severityModerate: 0, severityMild: 0, "clean": 0}
 	issueDist := map[int]int{}
 	checkStats := map[string]*checkBreakdown{}
 
 	for _, rec := range records {
 		if rec.Error != "" || rec.Analysis == nil {
-			errors++
+			errorCount++
 
 			continue
 		}
@@ -127,33 +135,34 @@ func printDigest(records []digestRecord) {
 			breakdown.Total++
 
 			switch issue.Severity {
-			case "severe":
+			case severitySevere:
 				breakdown.Severe++
-			case "moderate":
+			case severityModerate:
 				breakdown.Moderate++
-			case "mild":
+			case severityMild:
 				breakdown.Mild++
+			default:
 			}
 		}
 	}
 
-	analyzed := total - errors
+	analyzed := total - errorCount
 
-	fmt.Println("=== Haustorium Report Digest ===")
-	fmt.Println()
-	fmt.Printf("Total tracks:  %d\n", total)
-	fmt.Printf("Failed:        %d\n", errors)
-	fmt.Printf("Analyzed:      %d\n", analyzed)
-	fmt.Println()
+	fmt.Fprintln(os.Stdout, "=== Haustorium Report Digest ===")
+	fmt.Fprintln(os.Stdout)
+	fmt.Fprintf(os.Stdout, "Total tracks:  %d\n", total)
+	fmt.Fprintf(os.Stdout, "Failed:        %d\n", errorCount)
+	fmt.Fprintf(os.Stdout, "Analyzed:      %d\n", analyzed)
+	fmt.Fprintln(os.Stdout)
 
-	fmt.Println("--- Worst Severity ---")
-	fmt.Printf("  Clean:     %d\n", sevDist["clean"])
-	fmt.Printf("  Mild:      %d\n", sevDist["mild"])
-	fmt.Printf("  Moderate:  %d\n", sevDist["moderate"])
-	fmt.Printf("  Severe:    %d\n", sevDist["severe"])
-	fmt.Println()
+	fmt.Fprintln(os.Stdout, "--- Worst Severity ---")
+	fmt.Fprintf(os.Stdout, "  Clean:     %d\n", sevDist["clean"])
+	fmt.Fprintf(os.Stdout, "  Mild:      %d\n", sevDist[severityMild])
+	fmt.Fprintf(os.Stdout, "  Moderate:  %d\n", sevDist[severityModerate])
+	fmt.Fprintf(os.Stdout, "  Severe:    %d\n", sevDist[severitySevere])
+	fmt.Fprintln(os.Stdout)
 
-	fmt.Println("--- Issues Per Track ---")
+	fmt.Fprintln(os.Stdout, "--- Issues Per Track ---")
 
 	maxIssues := 0
 	for k := range issueDist {
@@ -164,13 +173,13 @@ func printDigest(records []digestRecord) {
 
 	for i := range maxIssues + 1 {
 		if count, ok := issueDist[i]; ok && count > 0 {
-			fmt.Printf("  %d issues:  %d tracks\n", i, count)
+			fmt.Fprintf(os.Stdout, "  %d issues:  %d tracks\n", i, count)
 		}
 	}
 
-	fmt.Println()
+	fmt.Fprintln(os.Stdout)
 
-	fmt.Println("--- Issues By Type ---")
+	fmt.Fprintln(os.Stdout, "--- Issues By Type ---")
 
 	breakdowns := make([]*checkBreakdown, 0, len(checkStats))
 	for _, bd := range checkStats {
@@ -182,8 +191,15 @@ func printDigest(records []digestRecord) {
 	})
 
 	for _, bd := range breakdowns {
-		fmt.Printf("  %s\n", bd.Check)
-		fmt.Printf("    total: %d  severe: %d  moderate: %d  mild: %d\n", bd.Total, bd.Severe, bd.Moderate, bd.Mild)
+		fmt.Fprintf(os.Stdout, "  %s\n", bd.Check)
+		fmt.Fprintf(
+			os.Stdout,
+			"    total: %d  severe: %d  moderate: %d  mild: %d\n",
+			bd.Total,
+			bd.Severe,
+			bd.Moderate,
+			bd.Mild,
+		)
 	}
 }
 
@@ -217,7 +233,7 @@ type issueEntry struct {
 }
 
 func printIssueDetail(records []digestRecord, rawLines [][]byte, check string) {
-	fmt.Println()
+	fmt.Fprintln(os.Stdout)
 
 	var entries []issueEntry
 
@@ -254,7 +270,7 @@ func printIssueDetail(records []digestRecord, rawLines [][]byte, check string) {
 	}
 
 	if len(entries) == 0 {
-		fmt.Printf("No tracks affected by %s\n", check)
+		fmt.Fprintf(os.Stdout, "No tracks affected by %s\n", check)
 
 		return
 	}
@@ -263,20 +279,20 @@ func printIssueDetail(records []digestRecord, rawLines [][]byte, check string) {
 		return severityRank(a.severity) - severityRank(b.severity)
 	})
 
-	fmt.Printf("=== %s: %d tracks ===\n\n", check, len(entries))
+	fmt.Fprintf(os.Stdout, "=== %s: %d tracks ===\n\n", check, len(entries))
 
 	for _, entry := range entries {
-		fmt.Printf("  %s\n", entry.file)
-		fmt.Printf("    severity: %s  confidence: %.0f%%\n", entry.severity, entry.confidence*100)
-		fmt.Printf("    %s\n", entry.summary)
+		fmt.Fprintf(os.Stdout, "  %s\n", entry.file)
+		fmt.Fprintf(os.Stdout, "    severity: %s  confidence: %.0f%%\n", entry.severity, entry.confidence*100)
+		fmt.Fprintf(os.Stdout, "    %s\n", entry.summary)
 
 		if entry.detail != nil {
 			for key, val := range entry.detail {
-				fmt.Printf("    %s: %s\n", key, formatDetailValue(val))
+				fmt.Fprintf(os.Stdout, "    %s: %s\n", key, formatDetailValue(val))
 			}
 		}
 
-		fmt.Println()
+		fmt.Fprintln(os.Stdout)
 	}
 }
 
@@ -302,11 +318,11 @@ func extractDetailFromRaw(rawLine []byte, key string) map[string]any {
 
 func severityRank(severity string) int {
 	switch severity {
-	case "severe":
+	case severitySevere:
 		return 0
-	case "moderate":
+	case severityModerate:
 		return 1
-	case "mild":
+	case severityMild:
 		return 2
 	default:
 		return 3
