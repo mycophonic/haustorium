@@ -8,7 +8,7 @@ require (
 	github.com/farcloser/agar v0.0.0-20260127201813-e4cfb90faa46
 	// Runtime dependencies
 	github.com/farcloser/primordium v0.0.0-20260128062542-c661940b809b
-	github.com/urfave/cli/v3 v3.6.2
+	github.com/urfave/cli/v3 v3.11.0
 	gonum.org/v1/gonum v0.17.0
 )
 
